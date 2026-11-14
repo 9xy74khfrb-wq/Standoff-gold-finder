@@ -1,9 +1,13 @@
 
 import os
+import re
 import sqlite3
 import logging
-import json
-import urllib.request
+import asyncio
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,11 +20,12 @@ from telegram.ext import (
 )
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-DB_NAME = "settings.db"
 
+DB_NAME = "settings.db"
 CATEGORY_URL = "https://funpay.com/chips/140/"
 
 
@@ -45,13 +50,11 @@ def get_settings(user_id):
             "INSERT OR IGNORE INTO settings (user_id) VALUES (?)",
             (user_id,)
         )
-        row = db.execute(
+        return db.execute(
             """SELECT min_price, max_price, min_amount, max_amount
                FROM settings WHERE user_id = ?""",
             (user_id,)
         ).fetchone()
-
-    return row
 
 
 def save_setting(user_id, field, value):
@@ -70,7 +73,7 @@ def save_setting(user_id, field, value):
         )
 
 
-# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+# ---------- МЕНЮ ----------
 
 def allowed_user(user_id):
     return user_id == OWNER_ID
@@ -107,34 +110,117 @@ def settings_text(user_id):
     return (
         "⚙️ Твои фильтры:\n\n"
         f"💰 Цена за 1 Gold: {fmt(min_p)}–{fmt(max_p)} ₽\n"
-        f"📦 Количество: {min_a}–{max_a} Gold\n\n"
-        "Измени настройки кнопками ниже."
+        f"📦 Количество: {min_a}–{max_a} Gold"
     )
 
 
-# ---------- КУРС USD → RUB ----------
+# ---------- ПОЛУЧЕНИЕ ОБЪЯВЛЕНИЙ ----------
 
-def get_usd_rub():
-    url = "https://open.er-api.com/v6/latest/USD"
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "GoldFinderBot/1.0"}
+def parse_number(text):
+    if not text:
+        return None
+
+    cleaned = text.replace("\xa0", " ").replace(",", ".")
+    match = re.search(r"\d+(?:\.\d+)?", cleaned)
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group())
+    except ValueError:
+        return None
+
+
+def fetch_offers():
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept-Language": "ru-RU,ru;q=0.9",
+    }
+
+    response = requests.get(
+        CATEGORY_URL,
+        headers=headers,
+        timeout=20
     )
+    response.raise_for_status()
 
-    with urllib.request.urlopen(request, timeout=10) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    if data.get("result") != "success":
-        raise ValueError("Не удалось получить курс")
+    rows = soup.select("a.tc-item")
+    offers = []
 
-    return float(data["rates"]["RUB"])
+    for row in rows:
+        price_element = row.select_one(".tc-price")
+        amount_element = row.select_one(".tc-amount")
+
+        if not price_element or not amount_element:
+            continue
+
+        price = parse_number(price_element.get_text(" ", strip=True))
+        amount_text = amount_element.get_text(" ", strip=True)
+        amount_number = parse_number(amount_text)
+
+        if price is None or amount_number is None:
+            continue
+
+        amount = int(amount_number)
+
+        href = row.get("href")
+        if not href:
+            continue
+
+        link = urljoin(CATEGORY_URL, href)
+
+        platform_element = (
+            row.select_one(".tc-server")
+            or row.select_one(".tc-side")
+            or row.select_one(".tc-desc-text")
+        )
+
+        platform = (
+            platform_element.get_text(" ", strip=True)
+            if platform_element else "Не указана"
+        )
+
+        seller_element = row.select_one(".media-user-name")
+        seller = (
+            seller_element.get_text(" ", strip=True)
+            if seller_element else "Не указан"
+        )
+
+        offers.append({
+            "price": price,
+            "amount": amount,
+            "platform": platform,
+            "seller": seller,
+            "link": link,
+        })
+
+    return offers
 
 
-def usd_to_rub(price_usd):
-    return price_usd * get_usd_rub()
+def find_matching_offers(user_id):
+    min_price, max_price, min_amount, max_amount = get_settings(user_id)
+
+    offers = fetch_offers()
+
+    matching = [
+        offer for offer in offers
+        if min_price <= offer["price"] <= max_price
+        and min_amount <= offer["amount"] <= max_amount
+    ]
+
+    matching.sort(key=lambda item: item["price"])
+
+    return matching
 
 
-# ---------- КОМАНДЫ ----------
+# ---------- TELEGRAM ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -145,8 +231,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_settings(user_id)
 
     await update.message.reply_text(
-        "🪙 Standoff 2 Gold Finder\n\n"
-        "Выбирай действие в меню:",
+        "🪙 Standoff 2 Gold Finder\n\nВыбирай действие:",
+        reply_markup=menu()
+    )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_user(update.effective_user.id):
+        return
+
+    context.user_data.pop("setting", None)
+    context.user_data.pop("temp_min", None)
+
+    await update.message.reply_text(
+        "Настройка отменена.",
         reply_markup=menu()
     )
 
@@ -163,17 +261,58 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed_user(update.effective_user.id):
+async def send_search_results(query, user_id):
+    await query.message.reply_text("🔎 Проверяю публичные объявления FunPay...")
+
+    try:
+        offers = await asyncio.to_thread(
+            find_matching_offers,
+            user_id
+        )
+
+    except requests.RequestException as error:
+        logger.warning("FunPay request error: %s", error)
+
+        await query.message.reply_text(
+            "Не удалось загрузить страницу FunPay.\n"
+            "Попробуй ещё раз немного позже."
+        )
         return
 
-    context.user_data.pop("setting", None)
-    context.user_data.pop("temp_min", None)
+    except Exception:
+        logger.exception("Ошибка поиска")
 
-    await update.message.reply_text(
-        "Настройка отменена.",
-        reply_markup=menu()
+        await query.message.reply_text(
+            "Произошла ошибка при обработке объявлений."
+        )
+        return
+
+    if not offers:
+        await query.message.reply_text(
+            "Подходящих объявлений не найдено.\n\n"
+            "Возможные причины:\n"
+            "• Нет предложений по твоему фильтру.\n"
+            "• FunPay не показал карточки в публичном ответе.\n"
+            "• Изменилась структура страницы.\n\n"
+            "Попробуй изменить фильтры или повторить поиск."
+        )
+        return
+
+    await query.message.reply_text(
+        f"✅ Найдено подходящих объявлений: {len(offers)}"
     )
+
+    for index, offer in enumerate(offers, start=1):
+        message = (
+            f"🪙 Объявление №{index}\n\n"
+            f"💰 Цена: {fmt(offer['price'])} ₽ за Gold\n"
+            f"📦 Количество: {offer['amount']} Gold\n"
+            f"📱 Платформа: {offer['platform']}\n"
+            f"👤 Продавец: {offer['seller']}\n\n"
+            f"🔗 {offer['link']}"
+        )
+
+        await query.message.reply_text(message)
 
 
 # ---------- КНОПКИ ----------
@@ -199,8 +338,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_text(
             "💰 Введи минимальную цену за 1 Gold в рублях.\n"
-            "Например: 0.30\n\n"
-            "Для отмены отправь /cancel"
+            "Например: 0.30\nДля отмены: /cancel"
         )
 
     elif query.data == "amount":
@@ -208,22 +346,11 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_text(
             "📦 Введи минимальное количество Gold.\n"
-            "Например: 100\n\n"
-            "Для отмены отправь /cancel"
+            "Например: 100\nДля отмены: /cancel"
         )
 
     elif query.data == "search":
-        await query.message.reply_text(
-            "🔎 Фильтры поиска:\n\n"
-            + settings_text(user_id)
-            + "\n\n"
-            "Публичная категория FunPay:\n"
-            + CATEGORY_URL
-            + "\n\n"
-            "Автоматический поиск пока не подключён: "
-            "нужен разрешённый источник данных FunPay. "
-            "Бот не будет показывать выдуманные объявления."
-        )
+        await send_search_results(query, user_id)
 
 
 # ---------- ВВОД ФИЛЬТРОВ ----------
@@ -249,7 +376,6 @@ async def receive_value(
             value = float(raw)
             if value <= 0:
                 raise ValueError
-
         else:
             value = int(raw)
             if value < 1:
@@ -266,7 +392,7 @@ async def receive_value(
         context.user_data["setting"] = "price_max"
 
         await update.message.reply_text(
-            "Теперь введи максимальную цену за 1 Gold в рублях."
+            "Теперь введи максимальную цену за 1 Gold."
         )
 
     elif setting == "price_max":
@@ -274,8 +400,7 @@ async def receive_value(
 
         if value < min_value:
             await update.message.reply_text(
-                "Максимальная цена не может быть меньше минимальной. "
-                "Введи её ещё раз."
+                "Максимальная цена не может быть меньше минимальной."
             )
             return
 
@@ -304,8 +429,7 @@ async def receive_value(
 
         if value < min_value:
             await update.message.reply_text(
-                "Максимальное количество не может быть меньше минимального. "
-                "Введи ещё раз."
+                "Максимальное количество не может быть меньше минимального."
             )
             return
 
