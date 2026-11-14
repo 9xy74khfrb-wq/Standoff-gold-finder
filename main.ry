@@ -1,1 +1,171 @@
 
+import os
+import sqlite3
+import logging
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes
+)
+
+TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+logging.basicConfig(level=logging.INFO)
+
+db = sqlite3.connect("settings.db", check_same_thread=False)
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    id INTEGER PRIMARY KEY,
+    min_price REAL DEFAULT 0.30,
+    max_price REAL DEFAULT 0.50,
+    min_amount INTEGER DEFAULT 100,
+    max_amount INTEGER DEFAULT 10000
+)
+""")
+db.execute("INSERT OR IGNORE INTO settings (id) VALUES (1)")
+db.commit()
+
+
+def get_settings():
+    return db.execute(
+        "SELECT min_price, max_price, min_amount, max_amount "
+        "FROM settings WHERE id=1"
+    ).fetchone()
+
+
+def allowed(update):
+    return update.effective_user.id == OWNER_ID
+
+
+def menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Мои настройки", callback_data="settings")],
+        [InlineKeyboardButton("💰 Изменить цену", callback_data="price")],
+        [InlineKeyboardButton("🪙 Изменить количество", callback_data="amount")],
+    ])
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+
+    await update.message.reply_text(
+        "🪙 STANDOFF GOLD FINDER\n\n"
+        "Бот для отслеживания предложений FunPay.\n\n"
+        "Выбери действие:",
+        reply_markup=menu()
+    )
+
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not allowed(update):
+        return
+
+    if query.data == "settings":
+        p1, p2, a1, a2 = get_settings()
+        await query.edit_message_text(
+            f"⚙️ ТВОИ НАСТРОЙКИ\n\n"
+            f"Цена за 1 голду: {p1:.2f}–{p2:.2f} ₽\n"
+            f"Количество: {a1}–{a2} голды\n\n"
+            f"Изменить цену: /price 0.30 0.50\n"
+            f"Изменить количество: /amount 100 10000",
+            reply_markup=menu()
+        )
+
+    elif query.data == "price":
+        await query.edit_message_text(
+            "💰 Отправь команду:\n/price 0.30 0.50"
+        )
+
+    elif query.data == "amount":
+        await query.edit_message_text(
+            "🪙 Отправь команду:\n/amount 100 10000"
+        )
+
+
+async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+
+    try:
+        low, high = map(float, context.args)
+
+        if low < 0 or high < low:
+            raise ValueError
+
+        db.execute(
+            "UPDATE settings SET min_price=?, max_price=? WHERE id=1",
+            (low, high)
+        )
+        db.commit()
+
+        await update.message.reply_text(
+            f"✅ Цена установлена: {low:.2f}–{high:.2f} ₽ за голду"
+        )
+    except (ValueError, TypeError):
+        await update.message.reply_text(
+            "Используй: /price 0.30 0.50"
+        )
+
+
+async def amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+
+    try:
+        low, high = map(int, context.args)
+
+        if low < 1 or high < low:
+            raise ValueError
+
+        db.execute(
+            "UPDATE settings SET min_amount=?, max_amount=? WHERE id=1",
+            (low, high)
+        )
+        db.commit()
+
+        await update.message.reply_text(
+            f"✅ Количество установлено: {low}–{high} голды"
+        )
+    except (ValueError, TypeError):
+        await update.message.reply_text(
+            "Используй: /amount 100 10000"
+        )
+
+
+async def main():
+    if not TOKEN or not OWNER_ID:
+        raise RuntimeError("Настрой BOT_TOKEN и OWNER_ID")
+
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("amount", amount))
+    app.add_handler(CallbackQueryHandler(buttons))
+
+    print("Bot started")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await asyncio.Event().wait()
+
+
+import asyncio
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+
