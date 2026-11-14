@@ -249,10 +249,15 @@ def fetch_offers():
 
     offers = []
 
-    logger.info("FunPay: карточек найдено: %s", len(rows))
+     logger.info("FunPay: карточек найдено: %s", len(rows))
 
     for row in rows:
         price_element = row.select_one(".tc-price")
+
+        if price_element:
+            print("DEBUG PRICE:", price_element.get_text(" ", strip=True))
+            print("DEBUG HTML:", str(price_element)[:1000])
+
         amount_element = row.select_one(".tc-amount")
 
         if not price_element or not amount_element:
