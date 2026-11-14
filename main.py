@@ -10,16 +10,11 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -52,6 +47,40 @@ DURATIONS = {
     21600: "6 часов",
 }
 
+DURATION_LABELS = {v: k for k, v in DURATIONS.items()}
+
+# ---------------- КЛАВИАТУРЫ ----------------
+
+MAIN_MENU = ReplyKeyboardMarkup(
+    [
+        ["🔎 Найти объявления", "🚀 Запустить"],
+        ["⛔ Остановить", "⚙️ Настройки"],
+        ["⏱ Длительность", "📋 Мои фильтры"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Выбери действие в меню",
+)
+
+SETTINGS_MENU = ReplyKeyboardMarkup(
+    [
+        ["💰 Изменить цену", "📦 Изменить количество"],
+        ["⬅️ Главное меню"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+DURATION_MENU = ReplyKeyboardMarkup(
+    [
+        ["5 минут", "15 минут"],
+        ["30 минут", "1 час"],
+        ["2 часа", "6 часов"],
+        ["⬅️ Главное меню"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 # ---------------- БАЗА ДАННЫХ ----------------
 
@@ -132,7 +161,7 @@ def mark_many_seen(offers):
         )
 
 
-# ---------------- ДОСТУП И ФОРМАТИРОВАНИЕ ----------------
+# ---------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------------
 
 def allowed_user(user_id):
     return user_id == OWNER_ID
@@ -146,80 +175,27 @@ def safe(value):
     return html.escape(str(value or "Не указан"))
 
 
-def menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🔎 Найти объявления",
-                callback_data="search",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🚀 Запустить мониторинг",
-                callback_data="durations",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💰 Настроить цену",
-                callback_data="price",
-            ),
-            InlineKeyboardButton(
-                "📦 Настроить Gold",
-                callback_data="amount",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "⚙️ Мои фильтры",
-                callback_data="status",
-            )
-        ],
-    ])
-
-
-def duration_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("5 минут", callback_data="monitor:300"),
-            InlineKeyboardButton("15 минут", callback_data="monitor:900"),
-        ],
-        [
-            InlineKeyboardButton("30 минут", callback_data="monitor:1800"),
-            InlineKeyboardButton("1 час", callback_data="monitor:3600"),
-        ],
-        [
-            InlineKeyboardButton("2 часа", callback_data="monitor:7200"),
-            InlineKeyboardButton("6 часов", callback_data="monitor:21600"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Назад", callback_data="back"),
-        ],
-    ])
-
-
-def stop_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "⛔ Остановить мониторинг",
-                callback_data="stop",
-            )
-        ]
-    ])
-
-
-def settings_text(user_id):
+def settings_text(user_id, context):
     min_p, max_p, min_a, max_a = get_settings(user_id)
 
+    task = context.application.bot_data.get(MONITOR_KEY)
+    running = task is not None and not task.done()
+
+    duration = context.user_data.get("monitor_duration", 900)
+
+    monitor_status = (
+        f"🟢 Работает ({DURATIONS[duration]})"
+        if running else "⚪ Остановлен"
+    )
+
     return (
-        "⚙️ <b>ТВОИ ФИЛЬТРЫ</b>\n"
+        "⚙️ <b>ТВОИ НАСТРОЙКИ</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"💰 Цена СБП за 1 Gold: <b>{fmt(min_p)}–{fmt(max_p)} ₽</b>\n"
         f"📦 Количество: <b>{min_a}–{max_a} Gold</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🔄 Частота проверки: <b>15 секунд</b>"
+        f"⏱ Длительность: <b>{DURATIONS[duration]}</b>\n"
+        f"📡 Мониторинг: <b>{monitor_status}</b>\n"
+        "🔄 Проверка: <b>каждые 15 секунд</b>"
     )
 
 
@@ -292,8 +268,6 @@ def fetch_offers():
             continue
 
         link = urljoin(CATEGORY_URL, href)
-
-        # Используем ссылку как уникальный идентификатор объявления.
         offer_id = href.strip()
 
         platform_element = (
@@ -359,47 +333,43 @@ def offer_message(offer, number=None):
 
 # ---------------- ПОИСК ----------------
 
-async def send_search_results(query, user_id):
-    await query.message.reply_text(
+async def send_search_results(message, user_id):
+    await message.reply_text(
         "🔎 <b>ИЩУ ОБЪЯВЛЕНИЯ...</b>\n"
         "Проверяю публичную страницу FunPay.",
         parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_MENU,
     )
 
     try:
         offers = await asyncio.to_thread(fetch_offers)
         matches = matching_offers(user_id, offers)
 
-    except requests.RequestException:
-        logger.exception("Ошибка запроса FunPay")
-        await query.message.reply_text(
-            "⚠️ Не удалось загрузить FunPay. Попробуй позже."
-        )
-        return
-
     except Exception:
         logger.exception("Ошибка поиска")
-        await query.message.reply_text(
-            "⚠️ Ошибка при обработке объявлений."
+        await message.reply_text(
+            "⚠️ Не удалось загрузить или обработать объявления FunPay.",
+            reply_markup=MAIN_MENU,
         )
         return
 
     if not matches:
-        await query.message.reply_text(
+        await message.reply_text(
             "😕 <b>Подходящих объявлений пока нет.</b>\n\n"
             "Попробуй изменить фильтры.",
             parse_mode=ParseMode.HTML,
-            reply_markup=menu(),
+            reply_markup=MAIN_MENU,
         )
         return
 
-    await query.message.reply_text(
+    await message.reply_text(
         f"✅ <b>Найдено объявлений: {len(matches)}</b>",
         parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_MENU,
     )
 
     for index, offer in enumerate(matches[:20], start=1):
-        await query.message.reply_text(
+        await message.reply_text(
             offer_message(offer, index),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -413,8 +383,6 @@ async def monitor_loop(application, user_id, duration, stop_event):
     deadline = started + duration
 
     try:
-        # Первый запрос — базовый список.
-        # Старые объявления не отправляем.
         initial = await asyncio.to_thread(fetch_offers)
         mark_many_seen(initial)
 
@@ -426,11 +394,10 @@ async def monitor_loop(application, user_id, duration, stop_event):
                 f"⏱ Длительность: <b>{DURATIONS[duration]}</b>\n"
                 "🔄 Проверка: каждые <b>15 секунд</b>\n"
                 "💰 Фильтр: <b>цена СБП</b>\n"
-                "🔔 Буду сообщать только о новых объявлениях.\n"
-                "━━━━━━━━━━━━━━━━━━"
+                "🔔 Буду сообщать только о новых объявлениях."
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=stop_menu(),
+            reply_markup=MAIN_MENU,
         )
 
         while (
@@ -444,13 +411,9 @@ async def monitor_loop(application, user_id, duration, stop_event):
                     if is_seen(offer["id"]):
                         continue
 
-                    # Сначала сохраняем ID, чтобы не повторить
-                    # уведомление при следующем цикле.
                     mark_seen(offer["id"])
 
-                    matches = matching_offers(user_id, [offer])
-
-                    if matches:
+                    if matching_offers(user_id, [offer]):
                         await application.bot.send_message(
                             chat_id=user_id,
                             text=offer_message(offer),
@@ -458,24 +421,15 @@ async def monitor_loop(application, user_id, duration, stop_event):
                             disable_web_page_preview=True,
                         )
 
-            except requests.RequestException:
-                logger.warning(
-                    "Временная ошибка запроса FunPay",
-                    exc_info=True,
-                )
+            except Exception:
+                logger.exception("Ошибка проверки FunPay")
                 await application.bot.send_message(
                     chat_id=user_id,
                     text=(
-                        "⚠️ FunPay временно не ответил. "
-                        "Повторю проверку через 15 секунд."
+                        "⚠️ Не удалось проверить FunPay. "
+                        "Попробую ещё раз через 15 секунд."
                     ),
-                )
-
-            except Exception:
-                logger.exception("Ошибка мониторинга")
-                await application.bot.send_message(
-                    chat_id=user_id,
-                    text="⚠️ Ошибка проверки. Попробую продолжить.",
+                    reply_markup=MAIN_MENU,
                 )
 
             remaining = deadline - asyncio.get_running_loop().time()
@@ -491,26 +445,26 @@ async def monitor_loop(application, user_id, duration, stop_event):
                 pass
 
         if stop_event.is_set():
-            message = "⛔ <b>МОНИТОРИНГ ОСТАНОВЛЕН</b>"
+            text = "⛔ <b>МОНИТОРИНГ ОСТАНОВЛЕН</b>"
         else:
-            message = "🏁 <b>ВРЕМЯ МОНИТОРИНГА ЗАВЕРШИЛОСЬ</b>"
+            text = "🏁 <b>ВРЕМЯ МОНИТОРИНГА ЗАВЕРШИЛОСЬ</b>"
 
         await application.bot.send_message(
             chat_id=user_id,
-            text=message,
+            text=text,
             parse_mode=ParseMode.HTML,
-            reply_markup=menu(),
+            reply_markup=MAIN_MENU,
         )
 
-    except requests.RequestException:
+    except Exception:
         logger.exception("Не удалось начать мониторинг")
         await application.bot.send_message(
             chat_id=user_id,
             text=(
-                "⚠️ Не удалось получить публичные объявления FunPay. "
+                "⚠️ Не удалось получить объявления FunPay. "
                 "Мониторинг не начался."
             ),
-            reply_markup=menu(),
+            reply_markup=MAIN_MENU,
         )
 
     finally:
@@ -518,163 +472,88 @@ async def monitor_loop(application, user_id, duration, stop_event):
         application.bot_data.pop(STOP_KEY, None)
 
 
-# ---------------- TELEGRAM КОМАНДЫ ----------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_monitor(update, context):
     user_id = update.effective_user.id
 
-    if not allowed_user(user_id):
+    current_task = context.application.bot_data.get(MONITOR_KEY)
+
+    if current_task and not current_task.done():
+        await update.message.reply_text(
+            "⚠️ Мониторинг уже запущен. Сначала останови его.",
+            reply_markup=MAIN_MENU,
+        )
         return
 
-    get_settings(user_id)
+    duration = context.user_data.get("monitor_duration", 900)
+    stop_event = asyncio.Event()
+
+    context.application.bot_data[STOP_KEY] = stop_event
+
+    task = context.application.create_task(
+        monitor_loop(
+            context.application,
+            user_id,
+            duration,
+            stop_event,
+        )
+    )
+    context.application.bot_data[MONITOR_KEY] = task
 
     await update.message.reply_text(
-        "🪙 <b>STANDOFF 2 GOLD FINDER</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "Добро пожаловать!\n\n"
-        "🔎 Поиск объявлений FunPay\n"
-        "💰 Фильтр по цене СБП\n"
-        "📦 Фильтр по количеству Gold\n"
-        "🚀 Автоматический мониторинг\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "Выбери действие:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=menu(),
+        f"⏳ Подготавливаю мониторинг на {DURATIONS[duration]}...",
+        reply_markup=MAIN_MENU,
     )
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def stop_monitor(update, context):
+    stop_event = context.application.bot_data.get(STOP_KEY)
 
-    if not allowed_user(user_id):
-        return
+    if stop_event:
+        stop_event.set()
+        await update.message.reply_text(
+            "⏳ Останавливаю мониторинг...",
+            reply_markup=MAIN_MENU,
+        )
+    else:
+        await update.message.reply_text(
+            "Сейчас мониторинг не запущен.",
+            reply_markup=MAIN_MENU,
+        )
 
-    await update.message.reply_text(
-        settings_text(user_id),
-        parse_mode=ParseMode.HTML,
-        reply_markup=menu(),
-    )
 
+# ---------------- НАСТРОЙКИ ----------------
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed_user(update.effective_user.id):
-        return
-
-    context.user_data.pop("setting", None)
+async def begin_setting(update, context, setting):
+    context.user_data["setting"] = setting
     context.user_data.pop("temp_min", None)
 
+    if setting == "price_min":
+        text = (
+            "💰 Введи минимальную цену СБП за 1 Gold.\n"
+            "Например: 0.10\n"
+            "Для отмены нажми «⬅️ Главное меню»."
+        )
+    elif setting == "amount_min":
+        text = (
+            "📦 Введи минимальное количество Gold.\n"
+            "Например: 10\n"
+            "Для отмены нажми «⬅️ Главное меню»."
+        )
+    else:
+        return
+
     await update.message.reply_text(
-        "Настройка отменена.",
-        reply_markup=menu(),
+        text,
+        reply_markup=SETTINGS_MENU,
     )
 
 
-# ---------------- КНОПКИ ----------------
-
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    if not allowed_user(user_id):
-        await query.answer()
-        return
-
-    await query.answer()
-
-    if query.data == "status":
-        await query.message.reply_text(
-            settings_text(user_id),
-            parse_mode=ParseMode.HTML,
-            reply_markup=menu(),
-        )
-
-    elif query.data == "back":
-        await query.message.reply_text(
-            "Главное меню:",
-            reply_markup=menu(),
-        )
-
-    elif query.data == "price":
-        context.user_data["setting"] = "price_min"
-        await query.message.reply_text(
-            "💰 Введи минимальную цену СБП за 1 Gold.\n"
-            "Например: 0.10\n"
-            "Для отмены: /cancel"
-        )
-
-    elif query.data == "amount":
-        context.user_data["setting"] = "amount_min"
-        await query.message.reply_text(
-            "📦 Введи минимальное количество Gold.\n"
-            "Например: 10\n"
-            "Для отмены: /cancel"
-        )
-
-    elif query.data == "search":
-        await send_search_results(query, user_id)
-
-    elif query.data == "durations":
-        await query.message.reply_text(
-            "🚀 <b>ВЫБЕРИ ВРЕМЯ МОНИТОРИНГА</b>\n\n"
-            "Бот будет проверять новые объявления каждые 15 секунд.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=duration_menu(),
-        )
-
-    elif query.data.startswith("monitor:"):
-        current_task = context.application.bot_data.get(MONITOR_KEY)
-
-        if current_task and not current_task.done():
-            await query.message.reply_text(
-                "⚠️ Мониторинг уже запущен. Сначала останови его."
-            )
-            return
-
-        duration = int(query.data.split(":")[1])
-
-        stop_event = asyncio.Event()
-        context.application.bot_data[STOP_KEY] = stop_event
-
-        task = context.application.create_task(
-            monitor_loop(
-                context.application,
-                user_id,
-                duration,
-                stop_event,
-            )
-        )
-        context.application.bot_data[MONITOR_KEY] = task
-
-    elif query.data == "stop":
-        stop_event = context.application.bot_data.get(STOP_KEY)
-
-        if stop_event:
-            stop_event.set()
-            await query.message.reply_text(
-                "⏳ Останавливаю мониторинг..."
-            )
-        else:
-            await query.message.reply_text(
-                "Сейчас мониторинг не запущен.",
-                reply_markup=menu(),
-            )
-
-
-# ---------------- ВВОД ФИЛЬТРОВ ----------------
-
-async def receive_value(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def receive_setting_value(update, context):
     user_id = update.effective_user.id
-
-    if not allowed_user(user_id):
-        return
-
     setting = context.user_data.get("setting")
 
     if not setting:
-        return
+        return False
 
     raw = update.message.text.strip().replace(",", ".")
 
@@ -692,7 +571,7 @@ async def receive_value(
         await update.message.reply_text(
             "❌ Введи корректное положительное число."
         )
-        return
+        return True
 
     if setting == "price_min":
         context.user_data["temp_min"] = value
@@ -709,7 +588,7 @@ async def receive_value(
             await update.message.reply_text(
                 "Максимальная цена не может быть меньше минимальной."
             )
-            return
+            return True
 
         save_setting(user_id, "min_price", min_value)
         save_setting(user_id, "max_price", value)
@@ -719,9 +598,9 @@ async def receive_value(
 
         await update.message.reply_text(
             "✅ Диапазон цены сохранён!\n\n"
-            + settings_text(user_id),
+            + settings_text(user_id, context),
             parse_mode=ParseMode.HTML,
-            reply_markup=menu(),
+            reply_markup=MAIN_MENU,
         )
 
     elif setting == "amount_min":
@@ -739,7 +618,7 @@ async def receive_value(
             await update.message.reply_text(
                 "Максимальное количество не может быть меньше минимального."
             )
-            return
+            return True
 
         save_setting(user_id, "min_amount", min_value)
         save_setting(user_id, "max_amount", value)
@@ -749,9 +628,148 @@ async def receive_value(
 
         await update.message.reply_text(
             "✅ Количество сохранено!\n\n"
-            + settings_text(user_id),
+            + settings_text(user_id, context),
             parse_mode=ParseMode.HTML,
-            reply_markup=menu(),
+            reply_markup=MAIN_MENU,
+        )
+
+    return True
+
+
+# ---------------- КОМАНДЫ ----------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not allowed_user(user_id):
+        return
+
+    get_settings(user_id)
+    context.user_data.setdefault("monitor_duration", 900)
+
+    await update.message.reply_text(
+        "🪙 <b>STANDOFF 2 GOLD FINDER</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Добро пожаловать!\n\n"
+        "🔎 Поиск публичных объявлений FunPay\n"
+        "💰 Фильтр по цене СБП\n"
+        "📦 Фильтр по количеству Gold\n"
+        "🚀 Мониторинг новых объявлений\n\n"
+        "Выбери действие в меню под строкой ввода.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_MENU,
+    )
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not allowed_user(user_id):
+        return
+
+    await update.message.reply_text(
+        settings_text(user_id, context),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_MENU,
+    )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_user(update.effective_user.id):
+        return
+
+    context.user_data.pop("setting", None)
+    context.user_data.pop("temp_min", None)
+
+    await update.message.reply_text(
+        "Настройка отменена.",
+        reply_markup=MAIN_MENU,
+    )
+
+
+# ---------------- ОБРАБОТКА МЕНЮ ----------------
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not allowed_user(user_id):
+        return
+
+    text = update.message.text.strip()
+
+    if text == "🔎 Найти объявления":
+        context.user_data.pop("setting", None)
+        await send_search_results(update.message, user_id)
+        return
+
+    if text == "🚀 Запустить":
+        context.user_data.pop("setting", None)
+        await start_monitor(update, context)
+        return
+
+    if text == "⛔ Остановить":
+        context.user_data.pop("setting", None)
+        await stop_monitor(update, context)
+        return
+
+    if text == "⚙️ Настройки":
+        context.user_data.pop("setting", None)
+        await update.message.reply_text(
+            "Выбери, что хочешь изменить:",
+            reply_markup=SETTINGS_MENU,
+        )
+        return
+
+    if text == "💰 Изменить цену":
+        await begin_setting(update, context, "price_min")
+        return
+
+    if text == "📦 Изменить количество":
+        await begin_setting(update, context, "amount_min")
+        return
+
+    if text == "⏱ Длительность":
+        context.user_data.pop("setting", None)
+        await update.message.reply_text(
+            "⏱ Выбери длительность мониторинга:",
+            reply_markup=DURATION_MENU,
+        )
+        return
+
+    if text in DURATION_LABELS:
+        context.user_data["monitor_duration"] = DURATION_LABELS[text]
+        await update.message.reply_text(
+            f"✅ Длительность установлена: <b>{text}</b>\n"
+            "Теперь нажми «🚀 Запустить».",
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    if text == "📋 Мои фильтры":
+        context.user_data.pop("setting", None)
+        await update.message.reply_text(
+            settings_text(user_id, context),
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    if text == "⬅️ Главное меню":
+        context.user_data.pop("setting", None)
+        context.user_data.pop("temp_min", None)
+        await update.message.reply_text(
+            "Главное меню:",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    handled = await receive_setting_value(update, context)
+
+    if not handled:
+        await update.message.reply_text(
+            "Выбери действие с помощью кнопок под строкой ввода.",
+            reply_markup=MAIN_MENU,
         )
 
 
@@ -772,11 +790,10 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    app.add_handler(CallbackQueryHandler(buttons))
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            receive_value,
+            handle_text,
         )
     )
 
