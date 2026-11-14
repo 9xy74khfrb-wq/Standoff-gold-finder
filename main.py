@@ -321,7 +321,7 @@ def fetch_offers():
         len(offers),
     )
 
-    return offers
+   
 
 
     return offers
