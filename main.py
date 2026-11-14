@@ -257,11 +257,9 @@ def fetch_offers():
         if not price_element or not amount_element:
             continue
 
-        # Берём текст именно из цены карточки.
         price_text = price_element.get_text(" ", strip=True)
         logger.info("FunPay: текст цены карточки: %r", price_text)
 
-        # Не выдаём евро за рубли.
         normalized_price_text = price_text.lower()
 
         is_rub = (
@@ -325,6 +323,72 @@ def fetch_offers():
     )
 
     return offers
+
+
+async def diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_user(update.effective_user.id):
+        return
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept-Language": "ru-RU,ru;q=0.9",
+    }
+
+    try:
+        response = await asyncio.to_thread(
+            requests.get,
+            CATEGORY_URL,
+            headers=headers,
+            cookies={"cy": "RUB", "locale": "ru"},
+            timeout=20,
+        )
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        rows = soup.select("a.tc-item")
+
+        report = [
+            "🔬 ДИАГНОСТИКА FUNPAY",
+            f"HTTP: {response.status_code}",
+            f"Адрес страницы: {response.url}",
+            f"Найдено карточек: {len(rows)}",
+            "",
+        ]
+
+        for index, row in enumerate(rows[:4], start=1):
+            price_element = row.select_one(".tc-price")
+
+            report.append(f"--- Карточка {index} ---")
+
+            if price_element:
+                price_text = price_element.get_text(" ", strip=True)
+                price_html = str(price_element)
+
+                report.append(f"Текст цены: {price_text!r}")
+                report.append("HTML ценника:")
+                report.append(price_html[:650])
+            else:
+                report.append("Элемент .tc-price не найден")
+
+            report.append("")
+
+        if not rows:
+            report.append("Карточки объявлений не найдены.")
+
+        message = "\n".join(report)
+
+        for start in range(0, len(message), 3500):
+            await update.message.reply_text(
+                message[start:start + 3500]
+            )
+
+    except Exception as error:
+        await update.message.reply_text(
+            f"Ошибка диагностики: {type(error).__name__}: {error}"
+        )
 
 
 def matching_offers(user_id, offers):
@@ -817,6 +881,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("diagnostic", diagnostic))
 
     app.add_handler(
         MessageHandler(
