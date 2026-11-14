@@ -1,274 +1,350 @@
 
 import os
-import json
-import math
-import asyncio
 import sqlite3
 import logging
+import json
 import urllib.request
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-DB = "settings.db"
+DB_NAME = "settings.db"
+
+CATEGORY_URL = "https://funpay.com/chips/140/"
 
 
-def db():
-    return sqlite3.connect(DB)
-
+# ---------- БАЗА ДАННЫХ ----------
 
 def init_db():
-    with db() as con:
-        con.execute("""
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 user_id INTEGER PRIMARY KEY,
-                min_price REAL NOT NULL DEFAULT 0.30,
-                max_price REAL NOT NULL DEFAULT 0.50,
-                min_amount INTEGER NOT NULL DEFAULT 100,
-                max_amount INTEGER NOT NULL DEFAULT 10000
-            )
-        """)
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS checked_offers (
-                offer_id TEXT PRIMARY KEY,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                min_price REAL DEFAULT 0.30,
+                max_price REAL DEFAULT 0.50,
+                min_amount INTEGER DEFAULT 100,
+                max_amount INTEGER DEFAULT 10000
             )
         """)
 
 
-def owner(update):
-    return (
-        update.effective_user is not None
-        and update.effective_user.id == OWNER_ID
-    )
-
-
-def get_settings():
-    with db() as con:
-        con.execute(
+def get_settings(user_id):
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute(
             "INSERT OR IGNORE INTO settings (user_id) VALUES (?)",
-            (OWNER_ID,)
+            (user_id,)
         )
-        return con.execute(
+        row = db.execute(
             """SELECT min_price, max_price, min_amount, max_amount
-               FROM settings WHERE user_id=?""",
-            (OWNER_ID,)
+               FROM settings WHERE user_id = ?""",
+            (user_id,)
         ).fetchone()
 
+    return row
 
-def get_rate():
-    url = "https://api.frankfurter.dev/v2/rate/usd/rub"
+
+def save_setting(user_id, field, value):
+    allowed = {
+        "min_price", "max_price",
+        "min_amount", "max_amount"
+    }
+
+    if field not in allowed:
+        return
+
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute(
+            f"UPDATE settings SET {field} = ? WHERE user_id = ?",
+            (value, user_id)
+        )
+
+
+# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+
+def allowed_user(user_id):
+    return user_id == OWNER_ID
+
+
+def fmt(value):
+    return f"{value:.2f}".replace(".", ",")
+
+
+def menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🔎 Найти объявления",
+            callback_data="search"
+        )],
+        [InlineKeyboardButton(
+            "💰 Изменить диапазон цены",
+            callback_data="price"
+        )],
+        [InlineKeyboardButton(
+            "📦 Изменить количество Gold",
+            callback_data="amount"
+        )],
+        [InlineKeyboardButton(
+            "⚙️ Мои фильтры",
+            callback_data="status"
+        )],
+    ])
+
+
+def settings_text(user_id):
+    min_p, max_p, min_a, max_a = get_settings(user_id)
+
+    return (
+        "⚙️ Твои фильтры:\n\n"
+        f"💰 Цена за 1 Gold: {fmt(min_p)}–{fmt(max_p)} ₽\n"
+        f"📦 Количество: {min_a}–{max_a} Gold\n\n"
+        "Измени настройки кнопками ниже."
+    )
+
+
+# ---------- КУРС USD → RUB ----------
+
+def get_usd_rub():
+    url = "https://open.er-api.com/v6/latest/USD"
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "GoldPriceChecker/1.0"}
+        headers={"User-Agent": "GoldFinderBot/1.0"}
     )
 
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with urllib.request.urlopen(request, timeout=10) as response:
         data = json.loads(response.read().decode("utf-8"))
 
-    rate = float(data["rate"])
-    if not math.isfinite(rate) or rate <= 0:
-        raise ValueError("Invalid exchange rate")
+    if data.get("result") != "success":
+        raise ValueError("Не удалось получить курс")
 
-    return rate, data.get("date", "unknown")
+    return float(data["rates"]["RUB"])
 
+
+def usd_to_rub(price_usd):
+    return price_usd * get_usd_rub()
+
+
+# ---------- КОМАНДЫ ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not owner(update):
+    user_id = update.effective_user.id
+
+    if not allowed_user(user_id):
         return
 
-    get_settings()
+    get_settings(user_id)
 
     await update.message.reply_text(
-        "Привет! Я бот для проверки цен Standoff 2 Gold.\n\n"
-        "Команды:\n"
-        "/price 0.30 0.50 — цена в рублях\n"
-        "/amount 100 10000 — количество голды\n"
-        "/status — текущие настройки\n"
-        "/check 0.0081 1309 — проверка цены в USD\n"
-        "/help — помощь"
+        "🪙 Standoff 2 Gold Finder\n\n"
+        "Выбирай действие в меню:",
+        reply_markup=menu()
     )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not owner(update):
-        return
-
-    await update.message.reply_text(
-        "Примеры команд:\n\n"
-        "/price 20 50\n"
-        "/price 0.30 0.50\n"
-        "/amount 100 10000\n"
-        "/check 0.0081 1309\n\n"
-        "В /check сначала указывается цена за одну голду в USD, "
-        "затем количество."
-    )
-
-
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not owner(update):
-        return
-
-    try:
-        if len(context.args) != 2:
-            raise ValueError
-
-        low, high = [
-            float(x.replace(",", "."))
-            for x in context.args
-        ]
-
-        if (
-            not math.isfinite(low)
-            or not math.isfinite(high)
-            or low <= 0
-            or high < low
-        ):
-            raise ValueError
-
-        with db() as con:
-            con.execute(
-                """UPDATE settings
-                   SET min_price=?, max_price=?
-                   WHERE user_id=?""",
-                (low, high, OWNER_ID)
-            )
-
-        await update.message.reply_text(
-            f"Цена сохранена: {low:g}–{high:g} ₽ за голду."
-        )
-
-    except (ValueError, TypeError):
-        await update.message.reply_text(
-            "Неверный формат.\nПример: /price 20 50"
-        )
-
-
-async def amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not owner(update):
-        return
-
-    try:
-        if len(context.args) != 2:
-            raise ValueError
-
-        low, high = map(int, context.args)
-
-        if low < 1 or high < low:
-            raise ValueError
-
-        with db() as con:
-            con.execute(
-                """UPDATE settings
-                   SET min_amount=?, max_amount=?
-                   WHERE user_id=?""",
-                (low, high, OWNER_ID)
-            )
-
-        await update.message.reply_text(
-            f"Количество сохранено: {low}–{high} голды."
-        )
-
-    except (ValueError, TypeError):
-        await update.message.reply_text(
-            "Неверный формат.\nПример: /amount 100 10000"
-        )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not owner(update):
+    user_id = update.effective_user.id
+
+    if not allowed_user(user_id):
         return
 
-    low_p, high_p, low_a, high_a = get_settings()
-
     await update.message.reply_text(
-        "Твои настройки:\n\n"
-        f"Цена: {low_p:g}–{high_p:g} ₽ за голду\n"
-        f"Количество: {low_a}–{high_a} голды"
+        settings_text(user_id),
+        reply_markup=menu()
     )
 
 
-async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not owner(update):
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_user(update.effective_user.id):
         return
 
+    context.user_data.pop("setting", None)
+    context.user_data.pop("temp_min", None)
+
+    await update.message.reply_text(
+        "Настройка отменена.",
+        reply_markup=menu()
+    )
+
+
+# ---------- КНОПКИ ----------
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if not allowed_user(user_id):
+        await query.answer()
+        return
+
+    await query.answer()
+
+    if query.data == "status":
+        await query.message.reply_text(
+            settings_text(user_id),
+            reply_markup=menu()
+        )
+
+    elif query.data == "price":
+        context.user_data["setting"] = "price_min"
+
+        await query.message.reply_text(
+            "💰 Введи минимальную цену за 1 Gold в рублях.\n"
+            "Например: 0.30\n\n"
+            "Для отмены отправь /cancel"
+        )
+
+    elif query.data == "amount":
+        context.user_data["setting"] = "amount_min"
+
+        await query.message.reply_text(
+            "📦 Введи минимальное количество Gold.\n"
+            "Например: 100\n\n"
+            "Для отмены отправь /cancel"
+        )
+
+    elif query.data == "search":
+        await query.message.reply_text(
+            "🔎 Фильтры поиска:\n\n"
+            + settings_text(user_id)
+            + "\n\n"
+            "Публичная категория FunPay:\n"
+            + CATEGORY_URL
+            + "\n\n"
+            "Автоматический поиск пока не подключён: "
+            "нужен разрешённый источник данных FunPay. "
+            "Бот не будет показывать выдуманные объявления."
+        )
+
+
+# ---------- ВВОД ФИЛЬТРОВ ----------
+
+async def receive_value(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user_id = update.effective_user.id
+
+    if not allowed_user(user_id):
+        return
+
+    setting = context.user_data.get("setting")
+
+    if not setting:
+        return
+
+    raw = update.message.text.strip().replace(",", ".")
+
     try:
-        if len(context.args) != 2:
-            raise ValueError
+        if setting.startswith("price"):
+            value = float(raw)
+            if value <= 0:
+                raise ValueError
 
-        usd_price = float(context.args[0].replace(",", "."))
-        quantity = int(context.args[1])
+        else:
+            value = int(raw)
+            if value < 1:
+                raise ValueError
 
-        if (
-            not math.isfinite(usd_price)
-            or usd_price <= 0
-            or quantity <= 0
-        ):
-            raise ValueError
-
-        await update.message.reply_text("Получаю курс доллара...")
-
-        rate, date = await asyncio.to_thread(get_rate)
-
-        rub_price = usd_price * rate
-        total_rub = rub_price * quantity
-
-        low_p, high_p, low_a, high_a = get_settings()
-
-        price_ok = low_p <= rub_price <= high_p
-        amount_ok = low_a <= quantity <= high_a
-
-        result = (
-            "Результат проверки:\n\n"
-            f"Цена за голду: ${usd_price:.6f}\n"
-            f"Цена в рублях: {rub_price:.4f} ₽\n"
-            f"Количество: {quantity}\n"
-            f"Общая стоимость: {total_rub:.2f} ₽\n\n"
-            f"Курс: 1 USD = {rate:.2f} RUB\n"
-            f"Дата курса: {date}\n\n"
-            f"Цена подходит: {'Да' if price_ok else 'Нет'}\n"
-            f"Количество подходит: {'Да' if amount_ok else 'Нет'}\n"
-            f"Итог: {'ПОДХОДИТ' if price_ok and amount_ok else 'НЕ ПОДХОДИТ'}"
-        )
-
-        await update.message.reply_text(result)
-
-    except (ValueError, TypeError):
+    except ValueError:
         await update.message.reply_text(
-            "Используй:\n/check 0.0081 1309"
+            "❌ Введи корректное положительное число."
         )
+        return
 
-    except Exception:
-        logging.exception("Ошибка проверки")
+    if setting == "price_min":
+        context.user_data["temp_min"] = value
+        context.user_data["setting"] = "price_max"
+
         await update.message.reply_text(
-            "Не удалось получить курс. Попробуй позже."
+            "Теперь введи максимальную цену за 1 Gold в рублях."
         )
 
+    elif setting == "price_max":
+        min_value = context.user_data["temp_min"]
+
+        if value < min_value:
+            await update.message.reply_text(
+                "Максимальная цена не может быть меньше минимальной. "
+                "Введи её ещё раз."
+            )
+            return
+
+        save_setting(user_id, "min_price", min_value)
+        save_setting(user_id, "max_price", value)
+
+        context.user_data.pop("setting", None)
+        context.user_data.pop("temp_min", None)
+
+        await update.message.reply_text(
+            "✅ Диапазон цены сохранён!\n\n"
+            + settings_text(user_id),
+            reply_markup=menu()
+        )
+
+    elif setting == "amount_min":
+        context.user_data["temp_min"] = value
+        context.user_data["setting"] = "amount_max"
+
+        await update.message.reply_text(
+            "Теперь введи максимальное количество Gold."
+        )
+
+    elif setting == "amount_max":
+        min_value = context.user_data["temp_min"]
+
+        if value < min_value:
+            await update.message.reply_text(
+                "Максимальное количество не может быть меньше минимального. "
+                "Введи ещё раз."
+            )
+            return
+
+        save_setting(user_id, "min_amount", min_value)
+        save_setting(user_id, "max_amount", value)
+
+        context.user_data.pop("setting", None)
+        context.user_data.pop("temp_min", None)
+
+        await update.message.reply_text(
+            "✅ Количество сохранено!\n\n"
+            + settings_text(user_id),
+            reply_markup=menu()
+        )
+
+
+# ---------- ЗАПУСК ----------
 
 def main():
-    if not BOT_TOKEN or not OWNER_ID:
-        raise RuntimeError("Не заданы BOT_TOKEN и OWNER_ID")
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задан BOT_TOKEN")
+
+    if not OWNER_ID:
+        raise RuntimeError("Не задан OWNER_ID")
 
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("price", price))
-    app.add_handler(CommandHandler("amount", amount))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("check", check))
+    app.add_handler(CommandHandler("cancel", cancel))
 
-    print("Bot started")
+    app.add_handler(CallbackQueryHandler(buttons))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_value)
+    )
+
+    print("Бот запущен")
     app.run_polling()
 
 
