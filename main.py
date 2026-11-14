@@ -5,7 +5,7 @@ import html
 import sqlite3
 import logging
 import asyncio
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -49,6 +49,7 @@ DURATIONS = {
 
 DURATION_LABELS = {v: k for k, v in DURATIONS.items()}
 
+
 # ---------------- КЛАВИАТУРЫ ----------------
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -81,6 +82,7 @@ DURATION_MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
     is_persistent=True,
 )
+
 
 # ---------------- БАЗА ДАННЫХ ----------------
 
@@ -228,6 +230,8 @@ def fetch_page():
             "Version/17.0 Mobile/15E148 Safari/604.1"
         ),
         "Accept-Language": "ru-RU,ru;q=0.9",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
     }
 
     response = requests.get(
@@ -237,7 +241,6 @@ def fetch_page():
         timeout=25,
     )
     response.raise_for_status()
-
     return response
 
 
@@ -300,13 +303,19 @@ def fetch_offers():
             if platform_element else "Не указана"
         )
 
+        link = urljoin(CATEGORY_URL, href)
+
+        # ID объявления берём из пути ссылки
+        parsed = urlparse(link)
+        offer_id = parsed.path.rstrip("/")
+
         offers.append({
-            "id": href.strip(),
+            "id": offer_id,
             "price": price,
             "amount": int(amount),
             "platform": platform,
             "seller": seller,
-            "link": urljoin(CATEGORY_URL, href),
+            "link": link,
         })
 
     logger.info(
@@ -324,7 +333,9 @@ def fetch_offers():
     return offers
 
 
-async def diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- ДИАГНОСТИКА ----------------
+
+async def diagnostic(update, context):
     if not allowed_user(update.effective_user.id):
         return
 
@@ -359,32 +370,15 @@ async def diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"количество {amount_text!r}"
             )
 
-        if not rows:
-            report.append("Карточки объявлений не найдены.")
-
-        report.append("")
-        report.append(
-            "Результат: "
-            + (
-                "цены в рублях"
-                if any(
-                    "₽" in line or "руб" in line.lower()
-                    for line in report
-                )
-                else "рублёвая валюта пока не подтверждена"
-            )
-        )
-
-        message = "\n".join(report)
-
-        for start in range(0, len(message), 3500):
-            await update.message.reply_text(message[start:start + 3500])
+        await update.message.reply_text("\n".join(report))
 
     except Exception as error:
         await update.message.reply_text(
             f"Ошибка диагностики: {type(error).__name__}: {error}"
         )
 
+
+# ---------------- ФИЛЬТРЫ ----------------
 
 def matching_offers(user_id, offers):
     min_price, max_price, min_amount, max_amount = get_settings(user_id)
@@ -403,7 +397,7 @@ def offer_message(offer, number=None):
     heading = (
         f"🆕 <b>НОВОЕ ОБЪЯВЛЕНИЕ №{number}</b>"
         if number is not None
-        else "🪙 <b>ОБЪЯВЛЕНИЕ FUNPAY</b>"
+        else "🪙 <b>НОВОЕ ОБЪЯВЛЕНИЕ FUNPAY</b>"
     )
 
     return (
@@ -473,6 +467,11 @@ async def monitor_loop(application, user_id, duration, stop_event):
         initial = await asyncio.to_thread(fetch_offers)
         mark_many_seen(initial)
 
+        logger.info(
+            "Мониторинг: начальный список содержит %s объявлений",
+            len(initial),
+        )
+
         await application.bot.send_message(
             chat_id=user_id,
             text=(
@@ -480,7 +479,8 @@ async def monitor_loop(application, user_id, duration, stop_event):
                 "━━━━━━━━━━━━━━━━━━\n"
                 f"⏱ Длительность: <b>{DURATIONS[duration]}</b>\n"
                 "🔄 Проверка: каждые <b>15 секунд</b>\n"
-                "🔔 Буду сообщать только о новых объявлениях."
+                f"📋 Уже существующих объявлений: <b>{len(initial)}</b>\n"
+                "🔔 Жду новые объявления."
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_MENU,
@@ -490,22 +490,44 @@ async def monitor_loop(application, user_id, duration, stop_event):
             try:
                 offers = await asyncio.to_thread(fetch_offers)
 
-                for offer in offers:
+                unique_offers = {
+                    offer["id"]: offer for offer in offers
+                }
+
+                new_offers = [
+                    offer for offer in unique_offers.values()
+                    if not is_seen(offer["id"])
+                ]
+
+                matches = matching_offers(user_id, new_offers)
+                matching_ids = {offer["id"] for offer in matches}
+
+                logger.info(
+                    "Мониторинг: карточек=%s, новых=%s, "
+                    "подходящих по фильтрам=%s",
+                    len(offers),
+                    len(new_offers),
+                    len(matches),
+                )
+
+                for offer in new_offers:
                     if stop_event.is_set():
                         break
 
-                    if is_seen(offer["id"]):
-                        continue
-
-                    mark_seen(offer["id"])
-
-                    if matching_offers(user_id, [offer]):
+                    if offer["id"] in matching_ids:
                         await application.bot.send_message(
                             chat_id=user_id,
                             text=offer_message(offer),
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True,
                         )
+
+                        logger.info(
+                            "Отправлено новое объявление: %s",
+                            offer["id"],
+                        )
+
+                    mark_seen(offer["id"])
 
             except Exception:
                 logger.exception("Ошибка проверки FunPay")
