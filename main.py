@@ -222,7 +222,6 @@ def parse_number(text):
         return None
 
 
-def fetch_offers():
   
 def fetch_offers():
     headers = {
