@@ -222,7 +222,6 @@ def parse_number(text):
         return None
 
 
-  
 def fetch_offers():
     headers = {
         "User-Agent": (
@@ -249,41 +248,32 @@ def fetch_offers():
 
     offers = []
 
-     logger.info("FunPay: карточек найдено: %s", len(rows))
+    logger.info("FunPay: карточек найдено: %s", len(rows))
 
     for row in rows:
         price_element = row.select_one(".tc-price")
-
-          logger.info("FunPay: карточек найдено: %s", len(rows))
-
-    for row in rows:
-        price_element = row.select_one(".tc-price")
-
-        if price_element:
-            print("DEBUG PRICE:", price_element.get_text(" ", strip=True))
-            print("DEBUG HTML:", str(price_element)[:1000])
-
         amount_element = row.select_one(".tc-amount")
 
         if not price_element or not amount_element:
             continue
 
-        price_value = price_element.select_one("div")
-        if not price_value:
-            price_value = price_element
+        # Берём текст именно из цены карточки.
+        price_text = price_element.get_text(" ", strip=True)
+        logger.info("FunPay: текст цены карточки: %r", price_text)
 
-        price_text = price_value.get_text(" ", strip=True)
-        unit_element = price_element.select_one(".unit")
-        unit_text = (
-            unit_element.get_text(" ", strip=True)
-            if unit_element else price_element.get_text(" ", strip=True)
+        # Не выдаём евро за рубли.
+        normalized_price_text = price_text.lower()
+
+        is_rub = (
+            "₽" in price_text
+            or "rub" in normalized_price_text
+            or "руб" in normalized_price_text
         )
 
-        # Не принимаем евро за рубли.
-        if "₽" not in unit_text and "RUB" not in unit_text.upper():
+        if not is_rub:
             logger.warning(
-                "Пропущена цена в неизвестной валюте: %r",
-                unit_text,
+                "Объявление пропущено: FunPay вернул не рубли: %r",
+                price_text,
             )
             continue
 
@@ -293,6 +283,10 @@ def fetch_offers():
         )
 
         if price is None or amount_number is None:
+            logger.warning(
+                "Не удалось прочитать цену или количество: %r",
+                price_text,
+            )
             continue
 
         href = row.get("href")
@@ -326,12 +320,9 @@ def fetch_offers():
         })
 
     logger.info(
-        "FunPay: обработано рублёвых объявлений: %s",
+        "FunPay: обработано объявлений в рублях: %s",
         len(offers),
     )
-
-   
-
 
     return offers
 
