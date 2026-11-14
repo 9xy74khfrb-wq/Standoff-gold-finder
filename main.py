@@ -121,10 +121,8 @@ def get_settings(user_id):
 
 def save_setting(user_id, field, value):
     allowed = {
-        "min_price",
-        "max_price",
-        "min_amount",
-        "max_amount",
+        "min_price", "max_price",
+        "min_amount", "max_amount",
     }
 
     if field not in allowed:
@@ -191,7 +189,7 @@ def settings_text(user_id, context):
     return (
         "⚙️ <b>ТВОИ НАСТРОЙКИ</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Цена СБП за 1 Gold: <b>{fmt(min_p)}–{fmt(max_p)} ₽</b>\n"
+        f"💰 Цена за 1 Gold: <b>{fmt(min_p)}–{fmt(max_p)} ₽</b>\n"
         f"📦 Количество: <b>{min_a}–{max_a} Gold</b>\n"
         f"⏱ Длительность: <b>{DURATIONS[duration]}</b>\n"
         f"📡 Мониторинг: <b>{monitor_status}</b>\n"
@@ -222,7 +220,7 @@ def parse_number(text):
         return None
 
 
-def fetch_offers():
+def fetch_page():
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -235,18 +233,21 @@ def fetch_offers():
     response = requests.get(
         CATEGORY_URL,
         headers=headers,
-        cookies={
-            "cy": "RUB",
-            "locale": "ru",
-        },
-        timeout=20,
+        cookies={"cy": "rub", "locale": "ru"},
+        timeout=25,
     )
     response.raise_for_status()
 
+    return response
+
+
+def fetch_offers():
+    response = fetch_page()
     soup = BeautifulSoup(response.text, "html.parser")
     rows = soup.select("a.tc-item")
 
     offers = []
+    skipped_currency = 0
 
     logger.info("FunPay: карточек найдено: %s", len(rows))
 
@@ -258,33 +259,24 @@ def fetch_offers():
             continue
 
         price_text = price_element.get_text(" ", strip=True)
-        logger.info("FunPay: текст цены карточки: %r", price_text)
-
-        normalized_price_text = price_text.lower()
+        normalized = price_text.lower()
 
         is_rub = (
             "₽" in price_text
-            or "rub" in normalized_price_text
-            or "руб" in normalized_price_text
+            or "rub" in normalized
+            or "руб" in normalized
         )
 
         if not is_rub:
-            logger.warning(
-                "Объявление пропущено: FunPay вернул не рубли: %r",
-                price_text,
-            )
+            skipped_currency += 1
             continue
 
         price = parse_number(price_text)
-        amount_number = parse_number(
+        amount = parse_number(
             amount_element.get_text(" ", strip=True)
         )
 
-        if price is None or amount_number is None:
-            logger.warning(
-                "Не удалось прочитать цену или количество: %r",
-                price_text,
-            )
+        if price is None or amount is None:
             continue
 
         href = row.get("href")
@@ -311,16 +303,23 @@ def fetch_offers():
         offers.append({
             "id": href.strip(),
             "price": price,
-            "amount": int(amount_number),
+            "amount": int(amount),
             "platform": platform,
             "seller": seller,
             "link": urljoin(CATEGORY_URL, href),
         })
 
     logger.info(
-        "FunPay: обработано объявлений в рублях: %s",
+        "FunPay: рублёвых объявлений: %s; пропущено из-за валюты: %s",
         len(offers),
+        skipped_currency,
     )
+
+    if not offers and rows and skipped_currency:
+        raise ValueError(
+            "FunPay вернул цены не в рублях. "
+            "Проверь валюту страницы FunPay."
+        )
 
     return offers
 
@@ -329,24 +328,8 @@ async def diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed_user(update.effective_user.id):
         return
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-            "Version/17.0 Mobile/15E148 Safari/604.1"
-        ),
-        "Accept-Language": "ru-RU,ru;q=0.9",
-    }
-
     try:
-        response = await asyncio.to_thread(
-            requests.get,
-            CATEGORY_URL,
-            headers=headers,
-            cookies={"cy": "RUB", "locale": "ru"},
-            timeout=20,
-        )
-
+        response = await asyncio.to_thread(fetch_page)
         soup = BeautifulSoup(response.text, "html.parser")
         rows = soup.select("a.tc-item")
 
@@ -358,32 +341,44 @@ async def diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "",
         ]
 
-        for index, row in enumerate(rows[:4], start=1):
+        for index, row in enumerate(rows[:5], start=1):
             price_element = row.select_one(".tc-price")
+            amount_element = row.select_one(".tc-amount")
 
-            report.append(f"--- Карточка {index} ---")
+            price_text = (
+                price_element.get_text(" ", strip=True)
+                if price_element else "Ценник не найден"
+            )
+            amount_text = (
+                amount_element.get_text(" ", strip=True)
+                if amount_element else "Количество не найдено"
+            )
 
-            if price_element:
-                price_text = price_element.get_text(" ", strip=True)
-                price_html = str(price_element)
-
-                report.append(f"Текст цены: {price_text!r}")
-                report.append("HTML ценника:")
-                report.append(price_html[:650])
-            else:
-                report.append("Элемент .tc-price не найден")
-
-            report.append("")
+            report.append(
+                f"Карточка {index}: цена {price_text!r}; "
+                f"количество {amount_text!r}"
+            )
 
         if not rows:
             report.append("Карточки объявлений не найдены.")
 
+        report.append("")
+        report.append(
+            "Результат: "
+            + (
+                "цены в рублях"
+                if any(
+                    "₽" in line or "руб" in line.lower()
+                    for line in report
+                )
+                else "рублёвая валюта пока не подтверждена"
+            )
+        )
+
         message = "\n".join(report)
 
         for start in range(0, len(message), 3500):
-            await update.message.reply_text(
-                message[start:start + 3500]
-            )
+            await update.message.reply_text(message[start:start + 3500])
 
     except Exception as error:
         await update.message.reply_text(
@@ -414,7 +409,7 @@ def offer_message(offer, number=None):
     return (
         f"{heading}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Цена СБП: <b>{fmt(offer['price'])} ₽ за 1 Gold</b>\n"
+        f"💰 Цена: <b>{fmt(offer['price'])} ₽ за 1 Gold</b>\n"
         f"📦 Количество: <b>{offer['amount']} Gold</b>\n"
         f"📱 Платформа: <b>{safe(offer['platform'])}</b>\n"
         f"👤 Продавец: <b>{safe(offer['seller'])}</b>\n"
@@ -437,10 +432,10 @@ async def send_search_results(message, user_id):
         offers = await asyncio.to_thread(fetch_offers)
         matches = matching_offers(user_id, offers)
 
-    except Exception:
+    except Exception as error:
         logger.exception("Ошибка поиска")
         await message.reply_text(
-            "⚠️ Не удалось загрузить или обработать объявления FunPay.",
+            f"⚠️ Ошибка поиска: {type(error).__name__}: {error}",
             reply_markup=MAIN_MENU,
         )
         return
@@ -471,8 +466,8 @@ async def send_search_results(message, user_id):
 # ---------------- МОНИТОРИНГ ----------------
 
 async def monitor_loop(application, user_id, duration, stop_event):
-    started = asyncio.get_running_loop().time()
-    deadline = started + duration
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + duration
 
     try:
         initial = await asyncio.to_thread(fetch_offers)
@@ -485,21 +480,20 @@ async def monitor_loop(application, user_id, duration, stop_event):
                 "━━━━━━━━━━━━━━━━━━\n"
                 f"⏱ Длительность: <b>{DURATIONS[duration]}</b>\n"
                 "🔄 Проверка: каждые <b>15 секунд</b>\n"
-                "💰 Фильтр: <b>цена СБП</b>\n"
                 "🔔 Буду сообщать только о новых объявлениях."
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_MENU,
         )
 
-        while (
-            asyncio.get_running_loop().time() < deadline
-            and not stop_event.is_set()
-        ):
+        while loop.time() < deadline and not stop_event.is_set():
             try:
                 offers = await asyncio.to_thread(fetch_offers)
 
                 for offer in offers:
+                    if stop_event.is_set():
+                        break
+
                     if is_seen(offer["id"]):
                         continue
 
@@ -518,13 +512,13 @@ async def monitor_loop(application, user_id, duration, stop_event):
                 await application.bot.send_message(
                     chat_id=user_id,
                     text=(
-                        "⚠️ Не удалось проверить FunPay. "
-                        "Попробую ещё раз через 15 секунд."
+                        "⚠️ Ошибка проверки FunPay. "
+                        "Повторю попытку через 15 секунд."
                     ),
                     reply_markup=MAIN_MENU,
                 )
 
-            remaining = deadline - asyncio.get_running_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
                 break
 
@@ -536,10 +530,11 @@ async def monitor_loop(application, user_id, duration, stop_event):
             except asyncio.TimeoutError:
                 pass
 
-        if stop_event.is_set():
-            text = "⛔ <b>МОНИТОРИНГ ОСТАНОВЛЕН</b>"
-        else:
-            text = "🏁 <b>ВРЕМЯ МОНИТОРИНГА ЗАВЕРШИЛОСЬ</b>"
+        text = (
+            "⛔ <b>МОНИТОРИНГ ОСТАНОВЛЕН</b>"
+            if stop_event.is_set()
+            else "🏁 <b>ВРЕМЯ МОНИТОРИНГА ЗАВЕРШИЛОСЬ</b>"
+        )
 
         await application.bot.send_message(
             chat_id=user_id,
@@ -552,16 +547,15 @@ async def monitor_loop(application, user_id, duration, stop_event):
         logger.exception("Не удалось начать мониторинг")
         await application.bot.send_message(
             chat_id=user_id,
-            text=(
-                "⚠️ Не удалось получить объявления FunPay. "
-                "Мониторинг не начался."
-            ),
+            text="⚠️ Не удалось начать мониторинг. Проверь диагностику FunPay.",
             reply_markup=MAIN_MENU,
         )
 
     finally:
-        application.bot_data.pop(MONITOR_KEY, None)
-        application.bot_data.pop(STOP_KEY, None)
+        current = application.bot_data.get(MONITOR_KEY)
+        if current is asyncio.current_task():
+            application.bot_data.pop(MONITOR_KEY, None)
+            application.bot_data.pop(STOP_KEY, None)
 
 
 async def start_monitor(update, context):
@@ -621,7 +615,7 @@ async def begin_setting(update, context, setting):
 
     if setting == "price_min":
         text = (
-            "💰 Введи минимальную цену СБП за 1 Gold.\n"
+            "💰 Введи минимальную цену за 1 Gold.\n"
             "Например: 0.10\n"
             "Для отмены нажми «⬅️ Главное меню»."
         )
@@ -634,10 +628,7 @@ async def begin_setting(update, context, setting):
     else:
         return
 
-    await update.message.reply_text(
-        text,
-        reply_markup=SETTINGS_MENU,
-    )
+    await update.message.reply_text(text, reply_markup=SETTINGS_MENU)
 
 
 async def receive_setting_value(update, context):
@@ -668,9 +659,8 @@ async def receive_setting_value(update, context):
     if setting == "price_min":
         context.user_data["temp_min"] = value
         context.user_data["setting"] = "price_max"
-
         await update.message.reply_text(
-            "Теперь введи максимальную цену СБП за 1 Gold."
+            "Теперь введи максимальную цену за 1 Gold."
         )
 
     elif setting == "price_max":
@@ -698,7 +688,6 @@ async def receive_setting_value(update, context):
     elif setting == "amount_min":
         context.user_data["temp_min"] = value
         context.user_data["setting"] = "amount_max"
-
         await update.message.reply_text(
             "Теперь введи максимальное количество Gold."
         )
@@ -744,7 +733,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━\n"
         "Добро пожаловать!\n\n"
         "🔎 Поиск публичных объявлений FunPay\n"
-        "💰 Фильтр по цене СБП\n"
+        "💰 Фильтр по цене\n"
         "📦 Фильтр по количеству Gold\n"
         "🚀 Мониторинг новых объявлений\n\n"
         "Выбери действие в меню под строкой ввода.",
@@ -891,7 +880,7 @@ def main():
     )
 
     logger.info("Standoff 2 Gold Finder запущен")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
