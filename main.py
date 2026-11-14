@@ -223,7 +223,8 @@ def parse_number(text):
 
 
 def fetch_offers():
-   def fetch_offers():
+  
+def fetch_offers():
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -236,6 +237,10 @@ def fetch_offers():
     response = requests.get(
         CATEGORY_URL,
         headers=headers,
+        cookies={
+            "cy": "RUB",
+            "locale": "ru",
+        },
         timeout=20,
     )
     response.raise_for_status()
@@ -245,7 +250,7 @@ def fetch_offers():
 
     offers = []
 
-    logger.info("FunPay: найдено карточек: %s", len(rows))
+    logger.info("FunPay: карточек найдено: %s", len(rows))
 
     for row in rows:
         price_element = row.select_one(".tc-price")
@@ -254,25 +259,28 @@ def fetch_offers():
         if not price_element or not amount_element:
             continue
 
-        price_text = price_element.get_text(" ", strip=True)
-        amount_text = amount_element.get_text(" ", strip=True)
+        price_value = price_element.select_one("div")
+        if not price_value:
+            price_value = price_element
 
-        price = parse_number(price_text)
-        amount_number = parse_number(amount_text)
-
-        seller_element = row.select_one(".media-user-name")
-        seller = (
-            seller_element.get_text(" ", strip=True)
-            if seller_element else "Не указан"
+        price_text = price_value.get_text(" ", strip=True)
+        unit_element = price_element.select_one(".unit")
+        unit_text = (
+            unit_element.get_text(" ", strip=True)
+            if unit_element else price_element.get_text(" ", strip=True)
         )
 
-        logger.info(
-            "FunPay карточка: продавец=%r, цена_текст=%r, "
-            "цена_число=%r, количество=%r",
-            seller,
-            price_text,
-            price,
-            amount_text,
+        # Не принимаем евро за рубли.
+        if "₽" not in unit_text and "RUB" not in unit_text.upper():
+            logger.warning(
+                "Пропущена цена в неизвестной валюте: %r",
+                unit_text,
+            )
+            continue
+
+        price = parse_number(price_text)
+        amount_number = parse_number(
+            amount_element.get_text(" ", strip=True)
         )
 
         if price is None or amount_number is None:
@@ -281,6 +289,12 @@ def fetch_offers():
         href = row.get("href")
         if not href:
             continue
+
+        seller_element = row.select_one(".media-user-name")
+        seller = (
+            seller_element.get_text(" ", strip=True)
+            if seller_element else "Не указан"
+        )
 
         platform_element = (
             row.select_one(".tc-server")
@@ -302,9 +316,13 @@ def fetch_offers():
             "link": urljoin(CATEGORY_URL, href),
         })
 
-    logger.info("FunPay: успешно обработано объявлений: %s", len(offers))
+    logger.info(
+        "FunPay: обработано рублёвых объявлений: %s",
+        len(offers),
+    )
 
     return offers
+
 
     return offers
 
