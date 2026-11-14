@@ -223,6 +223,7 @@ def parse_number(text):
 
 
 def fetch_offers():
+   def fetch_offers():
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -244,6 +245,8 @@ def fetch_offers():
 
     offers = []
 
+    logger.info("FunPay: найдено карточек: %s", len(rows))
+
     for row in rows:
         price_element = row.select_one(".tc-price")
         amount_element = row.select_one(".tc-amount")
@@ -251,24 +254,33 @@ def fetch_offers():
         if not price_element or not amount_element:
             continue
 
-        price = parse_number(
-            price_element.get_text(" ", strip=True)
+        price_text = price_element.get_text(" ", strip=True)
+        amount_text = amount_element.get_text(" ", strip=True)
+
+        price = parse_number(price_text)
+        amount_number = parse_number(amount_text)
+
+        seller_element = row.select_one(".media-user-name")
+        seller = (
+            seller_element.get_text(" ", strip=True)
+            if seller_element else "Не указан"
         )
-        amount_number = parse_number(
-            amount_element.get_text(" ", strip=True)
+
+        logger.info(
+            "FunPay карточка: продавец=%r, цена_текст=%r, "
+            "цена_число=%r, количество=%r",
+            seller,
+            price_text,
+            price,
+            amount_text,
         )
 
         if price is None or amount_number is None:
             continue
 
-        amount = int(amount_number)
-
         href = row.get("href")
         if not href:
             continue
-
-        link = urljoin(CATEGORY_URL, href)
-        offer_id = href.strip()
 
         platform_element = (
             row.select_one(".tc-server")
@@ -281,20 +293,18 @@ def fetch_offers():
             if platform_element else "Не указана"
         )
 
-        seller_element = row.select_one(".media-user-name")
-        seller = (
-            seller_element.get_text(" ", strip=True)
-            if seller_element else "Не указан"
-        )
-
         offers.append({
-            "id": offer_id,
+            "id": href.strip(),
             "price": price,
-            "amount": amount,
+            "amount": int(amount_number),
             "platform": platform,
             "seller": seller,
-            "link": link,
+            "link": urljoin(CATEGORY_URL, href),
         })
+
+    logger.info("FunPay: успешно обработано объявлений: %s", len(offers))
+
+    return offers
 
     return offers
 
