@@ -2,136 +2,177 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gold Finder</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-*{box-sizing:border-box}
-body{
- margin:0;background:#10141d;color:white;
- font-family:Arial,sans-serif;padding:20px;
-}
-h2{color:#e8b64d;margin-top:0}
-.card{
- background:#1b2432;padding:17px;
- border-radius:15px;margin-bottom:16px;
-}
-.label{color:#9eacbd;font-size:13px}
-input,select{
- width:100%;padding:13px;margin-top:8px;
- background:#26374a;color:white;
- border:1px solid #405064;border-radius:9px;
- font-size:16px;
-}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-button{
- width:100%;padding:15px;border:0;
- border-radius:10px;font-size:15px;
- font-weight:bold;margin-top:10px;
-}
-.start{background:#d5a63f;color:#171717}
-.stop{background:#344256;color:white}
-.status{font-size:23px;font-weight:bold;margin-top:8px}
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10131c">
+  <title>Standoff Gold Finder</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 24px 16px;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #10131c;
+      color: #f4f5fa;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 480px;
+      margin: 35px auto;
+    }
+
+    .logo {
+      text-align: center;
+      font-size: 38px;
+      margin-bottom: 10px;
+    }
+
+    h1 {
+      text-align: center;
+      font-size: 27px;
+      margin: 0 0 8px;
+    }
+
+    .subtitle {
+      color: #a6adbf;
+      text-align: center;
+      margin-bottom: 28px;
+    }
+
+    .card {
+      background: #1b2030;
+      border: 1px solid #30384c;
+      border-radius: 18px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+
+    .status {
+      display: inline-block;
+      padding: 7px 11px;
+      border-radius: 20px;
+      background: #39311e;
+      color: #ffd477;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+
+    button {
+      width: 100%;
+      border: 0;
+      border-radius: 12px;
+      padding: 15px;
+      background: #6c63ff;
+      color: white;
+      font-size: 16px;
+      font-weight: 600;
+      margin-top: 12px;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: #30384c;
+    }
+
+    button:active {
+      opacity: .8;
+    }
+
+    .muted {
+      color: #a6adbf;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .item {
+      padding: 12px 0;
+      border-bottom: 1px solid #30384c;
+    }
+
+    .item:last-child {
+      border-bottom: 0;
+    }
+
+    footer {
+      color: #777f92;
+      font-size: 12px;
+      text-align: center;
+      margin-top: 25px;
+    }
+  </style>
 </head>
+
 <body>
+  <main class="container">
+    <div class="logo">🪙</div>
+    <h1>Standoff Gold Finder</h1>
+    <p class="subtitle">Умный поиск объявлений FunPay</p>
 
-<h2>🎯 GOLD FINDER</h2>
+    <section class="card">
+      <h2>Аккаунт FunPay</h2>
+      <div class="status" id="accountStatus">
+        ● Не подключён
+      </div>
+      <p class="muted">
+        Подключение будет доступно после настройки
+        официального механизма авторизации FunPay.
+      </p>
+      <button onclick="showInfo()">
+        Подключить FunPay
+      </button>
+      <p class="muted" id="message" aria-live="polite"></p>
+    </section>
 
-<div class="card">
- <div class="label">СТАТУС МОНИТОРИНГА</div>
- <div class="status" id="status">Остановлен</div>
- <div class="label">Проверка каждые 15 секунд</div>
-</div>
+    <section class="card">
+      <h2>Мой мониторинг</h2>
+      <div class="item">
+        🔎 Поиск подходящих объявлений
+      </div>
+      <div class="item">
+        💰 Фильтр максимальной цены
+      </div>
+      <div class="item">
+        🔔 Уведомления в Telegram
+      </div>
+      <button class="secondary" onclick="openBot()">
+        Открыть Telegram-бота
+      </button>
+    </section>
 
-<div class="card">
- <b>💰 Цена СБП за 1 Gold</b>
- <div class="grid">
-  <div>
-   <div class="label">От, ₽</div>
-   <input id="minPrice" type="number" value="0.10" step="0.01">
-  </div>
-  <div>
-   <div class="label">До, ₽</div>
-   <input id="maxPrice" type="number" value="0.50" step="0.01">
-  </div>
- </div>
-</div>
+    <section class="card">
+      <h2>Безопасность</h2>
+      <p class="muted">
+        Не вводите пароль FunPay и коды подтверждения
+        на неизвестных страницах. Этот сайт пока
+        не выполняет авторизацию и не получает
+        данные вашего аккаунта.
+      </p>
+    </section>
 
-<div class="card">
- <b>📦 Количество Gold</b>
- <div class="grid">
-  <div>
-   <div class="label">От</div>
-   <input id="minAmount" type="number" value="10">
-  </div>
-  <div>
-   <div class="label">До</div>
-   <input id="maxAmount" type="number" value="10000">
-  </div>
- </div>
-</div>
+    <footer>
+      Standoff Gold Finder · Личный кабинет
+    </footer>
+  </main>
 
-<div class="card">
- <b>⏱ Длительность</b>
- <select id="duration">
-  <option value="300">5 минут</option>
-  <option value="900">15 минут</option>
-  <option value="1800">30 минут</option>
-  <option value="3600">1 час</option>
-  <option value="7200">2 часа</option>
-  <option value="21600">6 часов</option>
- </select>
-</div>
+  <script>
+    function showInfo() {
+      document.getElementById("message").textContent =
+        "Ожидается подключение поддерживаемого FunPay способа авторизации.";
+    }
 
-<button class="start" onclick="startMonitor()">
-🚀 ЗАПУСТИТЬ МОНИТОРИНГ
-</button>
+    function openBot() {
+      const username = "YOUR_BOT_USERNAME";
 
-<button class="stop" onclick="stopMonitor()">
-⛔ ОСТАНОВИТЬ
-</button>
+      if (username === "YOUR_BOT_USERNAME") {
+        alert("Сначала укажи username своего Telegram-бота в index.html.");
+        return;
+      }
 
-<div class="card" style="margin-top:18px">
- <b>🪙 Найденные объявления</b>
- <div id="offers" class="label" style="margin-top:12px">
-  Пока объявлений нет
- </div>
-</div>
-
-<script>
-const tg = window.Telegram.WebApp;
-tg.ready();
-tg.expand();
-
-function startMonitor(){
- const settings={
-  min_price:Number(document.getElementById("minPrice").value),
-  max_price:Number(document.getElementById("maxPrice").value),
-  min_amount:Number(document.getElementById("minAmount").value),
-  max_amount:Number(document.getElementById("maxAmount").value),
-  duration:Number(document.getElementById("duration").value)
- };
-
- if(settings.min_price<=0 ||
-    settings.max_price<settings.min_price ||
-    settings.min_amount<1 ||
-    settings.max_amount<settings.min_amount){
-  tg.showAlert("Проверь настройки фильтров");
-  return;
- }
-
- tg.sendData(JSON.stringify({
-  action:"start",
-  settings:settings
- }));
-}
-
-function stopMonitor(){
- tg.sendData(JSON.stringify({action:"stop"}));
-}
-</script>
-
+      window.location.href = "https://t.me/" + username;
+    }
+  </script>
 </body>
 </html>
