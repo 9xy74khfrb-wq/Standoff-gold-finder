@@ -5,7 +5,9 @@ import html
 import sqlite3
 import logging
 import asyncio
-from urllib.parse import urljoin, urlparse
+import time
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -35,6 +37,7 @@ DB_NAME = "settings.db"
 CATEGORY_URL = "https://funpay.com/chips/140/"
 
 DEFAULT_CHECK_INTERVAL = 15
+RECENT_SECONDS = 120
 
 CHECK_INTERVALS = {
     5: "5 секунд",
@@ -257,6 +260,147 @@ def settings_text(user_id, context):
     )
 
 
+# ---------------- ВРЕМЯ ПУБЛИКАЦИИ ----------------
+
+def parse_published_time(value):
+    if not value:
+        return None
+
+    value = str(value).strip()
+
+    # Unix timestamp: секунды или миллисекунды
+    if re.fullmatch(r"\d{10,13}", value):
+        try:
+            number = int(value)
+            if number > 10**12:
+                number = number / 1000
+            return float(number)
+        except (ValueError, OverflowError):
+            return None
+
+    # ISO дата и время
+    try:
+        parsed = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.timestamp()
+    except ValueError:
+        pass
+
+    # Дата формата 15.11.2026 10:20
+    for date_format in (
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%Y, %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            parsed = datetime.strptime(value, date_format)
+            parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            continue
+
+    # Относительное время: "2 минуты назад"
+    normalized = value.lower().replace("ё", "е")
+
+    if "только что" in normalized or "сейчас" in normalized:
+        return time.time()
+
+    match = re.search(
+        r"(\d+)\s*"
+        r"(секунд\w*|сек\.?|минут\w*|мин\.?|час\w*|дн\w*|день)"
+        r"\s*назад",
+        normalized,
+    )
+
+    if match:
+        number = int(match.group(1))
+        unit = match.group(2)
+
+        if unit.startswith("сек"):
+            seconds = number
+        elif unit.startswith("мин"):
+            seconds = number * 60
+        elif unit.startswith("час"):
+            seconds = number * 3600
+        else:
+            seconds = number * 86400
+
+        return time.time() - seconds
+
+    return None
+
+
+def extract_published_time(row):
+    candidates = []
+
+    # Атрибуты самой карточки
+    for attribute in (
+        "data-time",
+        "data-timestamp",
+        "data-created-at",
+        "data-date",
+        "datetime",
+        "title",
+    ):
+        value = row.get(attribute)
+        if value:
+            candidates.append(value)
+
+    # Элементы времени внутри карточки
+    for element in row.select(
+        "time, [data-time], [data-timestamp], "
+        "[data-created-at], [datetime]"
+    ):
+        for attribute in (
+            "datetime",
+            "data-time",
+            "data-timestamp",
+            "data-created-at",
+            "title",
+        ):
+            value = element.get(attribute)
+            if value:
+                candidates.append(value)
+
+        text = element.get_text(" ", strip=True)
+        if text:
+            candidates.append(text)
+
+    # Иногда FunPay показывает относительное время прямо в карточке
+    card_text = row.get_text(" ", strip=True)
+    relative_match = re.search(
+        r"(только что|\d+\s*"
+        r"(?:секунд\w*|сек\.?|минут\w*|мин\.?|"
+        r"час\w*|дн\w*|день)\s*назад)",
+        card_text.lower().replace("ё", "е"),
+    )
+
+    if relative_match:
+        candidates.append(relative_match.group(1))
+
+    for candidate in candidates:
+        timestamp = parse_published_time(candidate)
+        if timestamp is not None:
+            return timestamp
+
+    return None
+
+
+def is_published_recently(offer, seconds=RECENT_SECONDS):
+    published_at = offer.get("published_at")
+
+    if published_at is None:
+        return False
+
+    age = time.time() - published_at
+    return 0 <= age <= seconds
+
+
 # ---------------- ПАРСИНГ FUNPAY ----------------
 
 def parse_number(text):
@@ -344,6 +488,19 @@ def fetch_offers():
         if not href:
             continue
 
+        link = urljoin(CATEGORY_URL, href)
+        parsed = urlparse(link)
+        query = parse_qs(parsed.query)
+
+        # Используем настоящий ID объявления из URL,
+        # а не общий путь /lots/offer.
+        offer_id = (
+            query.get("id", [None])[0]
+            or parsed.path.rstrip("/") + (
+                "?" + parsed.query if parsed.query else ""
+            )
+        )
+
         seller_element = row.select_one(".media-user-name")
         seller = (
             seller_element.get_text(" ", strip=True)
@@ -361,17 +518,16 @@ def fetch_offers():
             if platform_element else "Не указана"
         )
 
-        link = urljoin(CATEGORY_URL, href)
-        parsed = urlparse(link)
-        offer_id = parsed.path.rstrip("/")
+        published_at = extract_published_time(row)
 
         offers.append({
-            "id": offer_id,
+            "id": str(offer_id),
             "price": price,
             "amount": int(amount),
             "platform": platform,
             "seller": seller,
             "link": link,
+            "published_at": published_at,
         })
 
     logger.info(
@@ -421,9 +577,12 @@ async def diagnostic(update, context):
                 if amount_element else "Количество не найдено"
             )
 
+            published_at = extract_published_time(row)
+
             report.append(
                 f"Карточка {index}: цена {price_text!r}; "
-                f"количество {amount_text!r}"
+                f"количество {amount_text!r}; "
+                f"время публикации: {published_at or 'не найдено'}"
             )
 
         await update.message.reply_text("\n".join(report))
@@ -449,12 +608,13 @@ def matching_offers(user_id, offers):
     return result
 
 
-def offer_message(offer, number=None):
-    heading = (
-        f"🆕 <b>НОВОЕ ОБЪЯВЛЕНИЕ №{number}</b>"
-        if number is not None
-        else "🪙 <b>НОВОЕ ОБЪЯВЛЕНИЕ FUNPAY</b>"
-    )
+def offer_message(offer, number=None, recent=False):
+    if recent:
+        heading = "🕑 <b>ОБЪЯВЛЕНИЕ ЗА ПОСЛЕДНИЕ 2 МИНУТЫ</b>"
+    elif number is not None:
+        heading = f"🆕 <b>НОВОЕ ОБЪЯВЛЕНИЕ №{number}</b>"
+    else:
+        heading = "🪙 <b>НОВОЕ ОБЪЯВЛЕНИЕ FUNPAY</b>"
 
     return (
         f"{heading}\n"
@@ -530,6 +690,10 @@ async def test_monitor(update, context):
     try:
         offers = await asyncio.to_thread(fetch_offers)
         matches = matching_offers(user_id, offers)
+        recent = [
+            offer for offer in offers
+            if is_published_recently(offer)
+        ]
         interval = get_check_interval(user_id)
 
         report = (
@@ -538,6 +702,9 @@ async def test_monitor(update, context):
             "🟢 FunPay: страница доступна\n"
             f"📋 Объявлений найдено: <b>{len(offers)}</b>\n"
             f"🎯 Подходит под фильтры: <b>{len(matches)}</b>\n"
+            f"🕑 Опубликовано за 2 минуты: <b>{len(recent)}</b>\n"
+            f"🕒 Время публикации найдено у: "
+            f"<b>{sum(1 for o in offers if o.get('published_at') is not None)}</b>\n"
             f"🔄 Интервал проверки: <b>{CHECK_INTERVALS[interval]}</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🟢 Получение объявлений работает.\n"
@@ -581,11 +748,27 @@ async def monitor_loop(
 
     try:
         initial = await asyncio.to_thread(fetch_offers)
+
+        # Сначала выбираем недавно опубликованные объявления,
+        # которые ещё не отправлялись пользователю.
+        recent_initial = [
+            offer for offer in initial
+            if is_published_recently(offer)
+            and not is_seen(offer["id"])
+        ]
+
+        # Запоминаем весь начальный список, чтобы старые объявления
+        # не приходили как новые при следующей проверке.
         mark_many_seen(initial)
 
+        recent_matches = matching_offers(user_id, recent_initial)
+
         logger.info(
-            "Мониторинг: начальный список содержит %s объявлений",
+            "Мониторинг: начальный список=%s, "
+            "опубликовано за 2 минуты=%s, подходит=%s",
             len(initial),
+            len(recent_initial),
+            len(recent_matches),
         )
 
         await application.bot.send_message(
@@ -596,11 +779,30 @@ async def monitor_loop(
                 f"⏱ Длительность: <b>{DURATIONS[duration]}</b>\n"
                 f"🔄 Проверка: каждые <b>{CHECK_INTERVALS[interval]}</b>\n"
                 f"📋 Уже существующих объявлений: <b>{len(initial)}</b>\n"
-                "🔔 Жду новые объявления."
+                f"🕑 Найдено объявлений за последние 2 минуты: "
+                f"<b>{len(recent_initial)}</b>\n"
+                "🔔 Проверяю новые объявления."
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_MENU,
         )
+
+        # Отправляем подходящие объявления из последних 2 минут.
+        for offer in recent_matches:
+            if stop_event.is_set():
+                break
+
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=offer_message(offer, recent=True),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+
+            logger.info(
+                "Отправлено недавнее объявление: %s",
+                offer["id"],
+            )
 
         while loop.time() < deadline and not stop_event.is_set():
             try:
@@ -643,6 +845,8 @@ async def monitor_loop(
                             offer["id"],
                         )
 
+                    # Запоминаем объявление независимо от фильтров,
+                    # чтобы не проверять его повторно.
                     mark_seen(offer["id"])
 
             except Exception:
@@ -878,6 +1082,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💰 Фильтр по цене\n"
         "📦 Фильтр по количеству Gold\n"
         "🚀 Мониторинг новых объявлений\n"
+        "🕑 Объявления за последние 2 минуты\n"
         "🔄 Настраиваемый интервал проверки\n\n"
         "Выбери действие в меню под строкой ввода.",
         parse_mode=ParseMode.HTML,
