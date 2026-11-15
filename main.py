@@ -99,7 +99,6 @@ DURATION_MENU = ReplyKeyboardMarkup(
         ["⬅️ Главное меню"],
     ],
     resize_keyboard=True,
-    is_persistent=True,
 )
 INTERVAL_MENU = ReplyKeyboardMarkup(
     [
@@ -109,7 +108,6 @@ INTERVAL_MENU = ReplyKeyboardMarkup(
         ["⬅️ Главное меню"],
     ],
     resize_keyboard=True,
-    is_persistent=True,
 )
 
 
@@ -489,6 +487,30 @@ def fetch_offers():
             seller_element.get_text(" ", strip=True)
             if seller_element else "Не указан"
         )
+
+        # Получаем ссылку на профиль из ссылки вокруг ника продавца.
+        seller_link = None
+        if seller_element:
+            seller_anchor = (
+                seller_element
+                if seller_element.name == "a"
+                else seller_element.find_parent("a")
+            )
+
+            if seller_anchor and seller_anchor.get("href"):
+                candidate = urljoin(CATEGORY_URL, seller_anchor["href"])
+                parsed_seller = urlparse(candidate)
+
+                if (
+                    parsed_seller.scheme in ("http", "https")
+                    and parsed_seller.netloc.lower() in (
+                        "funpay.com",
+                        "www.funpay.com",
+                    )
+                    and parsed_seller.path.startswith("/users/")
+                ):
+                    seller_link = candidate
+
         platform_element = (
             row.select_one(".tc-server")
             or row.select_one(".tc-side")
@@ -505,6 +527,7 @@ def fetch_offers():
             "amount": int(amount),
             "platform": platform,
             "seller": seller,
+            "seller_link": seller_link,
             "link": link,
             "published_at": extract_published_time(row),
         })
@@ -550,13 +573,24 @@ def offer_message(offer, number=None, recent=False):
     else:
         heading = "🪙 <b>НОВОЕ ОБЪЯВЛЕНИЕ FUNPAY</b>"
 
+    seller_name = safe(offer["seller"])
+    seller_link = offer.get("seller_link")
+
+    if seller_link:
+        seller_text = (
+            f'<a href="{html.escape(seller_link, quote=True)}">'
+            f'{seller_name}</a>'
+        )
+    else:
+        seller_text = seller_name
+
     return (
         f"{heading}\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"💰 Цена: <b>{fmt(offer['price'])} ₽ за 1 Gold</b>\n"
         f"📦 Количество: <b>{offer['amount']} Gold</b>\n"
         f"📱 Платформа: <b>{safe(offer['platform'])}</b>\n"
-        f"👤 Продавец: <b>{safe(offer['seller'])}</b>\n"
+        f"👤 Продавец: {seller_text}\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "Нажми кнопку, чтобы открыть объявление на FunPay.\n"
         "Покупку и оплату ты подтверждаешь самостоятельно."
