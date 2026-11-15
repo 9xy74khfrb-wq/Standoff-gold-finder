@@ -662,44 +662,29 @@ async def diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             report.append(f"Карточка {index}")
             report.append(f"Продавец: {seller}")
 
-            if seller_element:
-                report.append(
-                    f"HTML ника: {str(seller_element)[:500]}"
-                )
+          
+            report.append(f"Продавец: {seller}")
+            report.append(f"Атрибуты ника: {seller_element.attrs if seller_element else 'Нет'}")
+            report.append(f"Атрибуты карточки: {row.attrs}")
 
+            if seller_element:
                 parent = seller_element
-                for level in range(4):
+                for level in range(1, 5):
+                    parent = parent.parent
                     if not parent:
                         break
+                    report.append(
+                        f"Родитель {level}: {parent.name}, "
+                        f"атрибуты: {parent.attrs}"
+                    )
 
-                    href = parent.get("href")
-                    if href:
-                        report.append(
-                            f"Ссылка родителя {level}: "
-                            f"{urljoin(CATEGORY_URL, href)}"
-                        )
-
-                    parent = parent.parent
-
-            links = []
-            for element in row.select("a[href]"):
-                href = element.get("href")
-                if href:
-                    links.append(urljoin(CATEGORY_URL, href))
-
-            report.append("Ссылки карточки:")
-            report.extend(links[:8] if links else ["Не найдены"])
-            report.append("----------------")
-
-        text = "\n".join(report)
-
-        for start in range(0, len(text), 3500):
-            await update.message.reply_text(text[start:start + 3500])
-
-    except Exception as error:
-        await update.message.reply_text(
-            f"Ошибка диагностики: {type(error).__name__}: {error}"
-        )
+            user_matches = re.findall(
+                r".{0,100}(?:user_id|userId|userid|/users/).{0,150}",
+                response.text,
+                re.IGNORECASE,
+            )
+            report.append("Фрагменты с ID профилей:")
+            report.extend(user_matches[:5] or ["Не найдены"])
 
 
 # ---------------- МОНИТОРИНГ ----------------
