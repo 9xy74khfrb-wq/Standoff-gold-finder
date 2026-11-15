@@ -4,196 +4,236 @@ import html
 import time
 import sqlite3
 import asyncio
+import secrets
+import hashlib
 import logging
-import statistics
-import unicodedata
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
 
-from telegram import (
-    Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-)
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ContextTypes, filters,
 )
 
 # ============================================================
-# FUNPAY STEAL A BRAINROT — PUBLIC MARKET SCANNER
-# Покупка и оплата выполняются пользователем вручную на FunPay.
-# Не запрашивает логин, пароль, 2FA или cookies аккаунта.
+# STANDOFF 2 GOLD FINDER
+# Публичный поиск объявлений FunPay. Покупка вручную.
 # ============================================================
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("brainrot_scanner")
+log = logging.getLogger("standoff_finder")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-DB_NAME = os.getenv("DB_NAME", "brainrot_settings.db")
+DB_NAME = os.getenv("DB_NAME", "settings.db")
 
-CATEGORY_URL = "https://funpay.com/lots/3503/"
-CATEGORY_NAME = "Steal a Brainrot"
+CATEGORY_URL = "https://funpay.com/chips/140/"
+DEFAULT_INTERVAL = 15
+DEFAULT_DURATION = 900
+RECENT_SECONDS = 120
 
-# Настройки сканирования. Сканируются только публичные страницы FunPay.
-MIN_COMPARABLES = 3
-MAX_PAGES = 25
-MAX_DETAILS_PER_SCAN = 250
-REQUEST_DELAY = 0.25
-DEFAULT_DISCOUNT = 40.0
-DEFAULT_MIN_PRICE = 0.01
-DEFAULT_MAX_PRICE = 100000.0
-DEFAULT_INTERVAL = 180
-DETAIL_CACHE_TTL = 600
-
-DETAIL_CACHE = {}
-MONITORS = {}
+INTERVALS = {
+    "5 секунд": 5,
+    "10 секунд": 10,
+    "15 секунд": 15,
+    "30 секунд": 30,
+    "1 минута": 60,
+    "2 минуты": 120,
+}
+DURATIONS = {
+    "5 минут": 300,
+    "15 минут": 900,
+    "30 минут": 1800,
+    "1 час": 3600,
+    "2 часа": 7200,
+    "6 часов": 21600,
+}
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
-        ["🔎 Найти выгодные", "🚀 Запустить мониторинг"],
-        ["⛔ Остановить", "⚙️ Настройки"],
-        ["📊 Мои параметры", "🧪 Проверить FunPay"],
+        ["🔎 Найти объявления", "🚀 Запустить мониторинг"],
+        ["⛔ Остановить", "🧪 Тест мониторинга"],
+        ["⚙️ Настройки", "📋 Мои фильтры"],
+        ["⏱ Длительность", "❔ Помощь"],
     ],
     resize_keyboard=True,
     is_persistent=True,
+    input_field_placeholder="Выбери действие",
 )
-
 SETTINGS_MENU = ReplyKeyboardMarkup(
     [
-        ["🎯 Порог скидки", "💰 Мин. цена"],
-        ["💵 Макс. цена", "🔄 Интервал"],
+        ["💰 Изменить цену", "📦 Изменить количество"],
+        ["🔄 Интервал обновления"],
         ["⬅️ Главное меню"],
     ],
     resize_keyboard=True,
 )
+DURATION_MENU = ReplyKeyboardMarkup(
+    [["5 минут", "15 минут"], ["30 минут", "1 час"], ["2 часа", "6 часов"],
+     ["⬅️ Главное меню"]],
+    resize_keyboard=True,
+)
+INTERVAL_MENU = ReplyKeyboardMarkup(
+    [["5 секунд", "10 секунд"], ["15 секунд", "30 секунд"],
+     ["1 минута", "2 минуты"], ["⬅️ Главное меню"]],
+    resize_keyboard=True,
+)
 
-INTERVALS = {
-    "1 минута": 60,
-    "3 минуты": 180,
-    "5 минут": 300,
-    "10 минут": 600,
-}
+MONITORS_KEY = "monitor_tasks"
+STOPS_KEY = "monitor_stops"
 
-
-# ---------------- DATABASE ----------------
-
-def db():
-    return sqlite3.connect(DB_NAME, timeout=30)
-
-
-def init_db():
-    with db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                min_price REAL NOT NULL DEFAULT 0.01,
-                max_price REAL NOT NULL DEFAULT 100000,
-                discount REAL NOT NULL DEFAULT 40,
-                interval INTEGER NOT NULL DEFAULT 180
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS seen (
-                user_id INTEGER NOT NULL,
-                offer_id TEXT NOT NULL,
-                PRIMARY KEY(user_id, offer_id)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS access (
-                user_id INTEGER PRIMARY KEY
-            )
-        """)
-
-
-def ensure_user(user_id):
-    with db() as conn:
-        conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
-
-
-def get_settings(user_id):
-    ensure_user(user_id)
-    with db() as conn:
-        row = conn.execute(
-            "SELECT min_price,max_price,discount,interval FROM users WHERE user_id=?",
-            (user_id,),
-        ).fetchone()
-    return row
-
-
-def save_settings(user_id, **values):
-    allowed = {"min_price", "max_price", "discount", "interval"}
-    if not values or not set(values).issubset(allowed):
-        raise ValueError("Недопустимые параметры")
-    ensure_user(user_id)
-    fields = ", ".join(f"{key}=?" for key in values)
-    with db() as conn:
-        conn.execute(
-            f"UPDATE users SET {fields} WHERE user_id=?",
-            (*values.values(), user_id),
-        )
-
-
-def is_authorized(user_id):
-    if user_id == OWNER_ID:
-        return True
-    with db() as conn:
-        return conn.execute(
-            "SELECT 1 FROM access WHERE user_id=?", (user_id,)
-        ).fetchone() is not None
-
-
-def set_authorized(user_id, allowed):
-    with db() as conn:
-        if allowed:
-            conn.execute("INSERT OR IGNORE INTO access(user_id) VALUES(?)", (user_id,))
-        else:
-            conn.execute("DELETE FROM access WHERE user_id=?", (user_id,))
-
-
-def seen(user_id, offer_id):
-    with db() as conn:
-        return conn.execute(
-            "SELECT 1 FROM seen WHERE user_id=? AND offer_id=?",
-            (user_id, str(offer_id)),
-        ).fetchone() is not None
-
-
-def mark_seen(user_id, offer_id):
-    with db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO seen(user_id,offer_id) VALUES(?,?)",
-            (user_id, str(offer_id)),
-        )
-
-
-# ---------------- FUNPAY PARSER ----------------
-
-SESSION_HEADERS = {
+HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
 }
 
 
-def clean(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+# ---------------- DATABASE ----------------
+
+def db_connect():
+    return sqlite3.connect(DB_NAME, timeout=30)
 
 
-def number(value):
+def init_db():
+    with db_connect() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                user_id INTEGER PRIMARY KEY,
+                min_price REAL NOT NULL DEFAULT 0.10,
+                max_price REAL NOT NULL DEFAULT 0.50,
+                min_amount INTEGER NOT NULL DEFAULT 10,
+                max_amount INTEGER NOT NULL DEFAULT 10000,
+                check_interval INTEGER NOT NULL DEFAULT 15
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS seen_offers (
+                user_id INTEGER NOT NULL,
+                offer_id TEXT NOT NULL,
+                PRIMARY KEY(user_id, offer_id)
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS access_keys (
+                key_hash TEXT PRIMARY KEY,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS authorized_users (
+                user_id INTEGER PRIMARY KEY,
+                activated_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS action_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                offer_id TEXT,
+                action TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+
+
+def ensure_settings(user_id):
+    with db_connect() as db:
+        db.execute("INSERT OR IGNORE INTO settings(user_id) VALUES(?)", (user_id,))
+
+
+def get_settings(user_id):
+    ensure_settings(user_id)
+    with db_connect() as db:
+        return db.execute(
+            """SELECT min_price,max_price,min_amount,max_amount,check_interval
+               FROM settings WHERE user_id=?""",
+            (user_id,),
+        ).fetchone()
+
+
+def save_setting(user_id, field, value):
+    allowed = {"min_price", "max_price", "min_amount", "max_amount", "check_interval"}
+    if field not in allowed:
+        raise ValueError("Недопустимая настройка")
+    ensure_settings(user_id)
+    with db_connect() as db:
+        db.execute(f"UPDATE settings SET {field}=? WHERE user_id=?", (value, user_id))
+
+
+def key_digest(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def allowed_user(user_id):
+    if user_id == OWNER_ID:
+        return True
+    now = time.time()
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT expires_at FROM authorized_users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row[0] <= now:
+            db.execute("DELETE FROM authorized_users WHERE user_id=?", (user_id,))
+            return False
+        return True
+
+
+def access_expiry(user_id):
+    if user_id == OWNER_ID:
+        return None
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT expires_at FROM authorized_users WHERE user_id=?", (user_id,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def is_seen(user_id, offer_id):
+    with db_connect() as db:
+        return db.execute(
+            "SELECT 1 FROM seen_offers WHERE user_id=? AND offer_id=?",
+            (user_id, str(offer_id)),
+        ).fetchone() is not None
+
+
+def mark_seen(user_id, offer_id):
+    with db_connect() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO seen_offers(user_id,offer_id) VALUES(?,?)",
+            (user_id, str(offer_id)),
+        )
+
+
+def log_action(user_id, offer_id, action):
+    with db_connect() as db:
+        db.execute(
+            "INSERT INTO action_history(user_id,offer_id,action,created_at) VALUES(?,?,?,?)",
+            (user_id, str(offer_id or ""), action, time.time()),
+        )
+
+
+# ---------------- FUNPAY PARSER ----------------
+
+def parse_number(value):
     if not value:
         return None
-    raw = str(value).replace("\xa0", " ").replace(",", ".")
-    raw = raw.replace(" ", "")
-    match = re.search(r"\d+(?:\.\d+)?", raw)
+    value = str(value).replace("\xa0", " ").replace(",", ".").replace(" ", "")
+    match = re.search(r"\d+(?:\.\d+)?", value)
     if not match:
         return None
     try:
@@ -202,531 +242,646 @@ def number(value):
         return None
 
 
-def get_offer_id(link):
-    parsed = urlparse(link)
-    query = parse_qs(parsed.query)
-    return str(query.get("id", [parsed.path])[0])
-
-
-def pagination_pages(soup):
-    found = set()
-    for a in soup.select('a[href*="page="]'):
-        value = parse_qs(urlparse(a.get("href", "")).query).get("page", [None])[0]
+def parse_published_time(value):
+    if not value:
+        return None
+    value = str(value).strip()
+    if re.fullmatch(r"\d{10,13}", value):
         try:
-            page = int(value)
-            if 0 <= page < MAX_PAGES:
-                found.add(page)
-        except (ValueError, TypeError):
-            pass
-    return sorted(found)
-
-
-def page_url(page):
-    parsed = urlparse(CATEGORY_URL)
-    query = parse_qs(parsed.query)
-    query["page"] = [str(page)]
-    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
-
-
-def get_description(soup):
-    chunks = []
-    for heading in soup.find_all(re.compile(r"^h[1-6]$")):
-        label = clean(heading.get_text(" ", strip=True)).casefold()
-        if any(x in label for x in (
-            "short description", "detailed description",
-            "краткое описание", "подробное описание",
-        )):
-            parts = []
-            for node in heading.find_all_next():
-                if node.name and re.fullmatch(r"h[1-6]", node.name):
-                    break
-                if node.name in ("script", "style", "nav", "footer"):
-                    continue
-                value = clean(node.get_text(" ", strip=True))
-                if value and value not in parts:
-                    parts.append(value)
-            if parts:
-                chunks.append(" ".join(parts[:25]))
-
-    if chunks:
-        return " ".join(chunks)
-
-    for selector in (
-        ".offer-desc", ".offer-description", ".offer-item-description",
-        ".description",
-    ):
-        node = soup.select_one(selector)
-        if node:
-            value = clean(node.get_text(" ", strip=True))
-            if len(value) >= 8:
-                return value
-    return ""
-
-
-def normalize_signature(title, description):
-    # Убираем типовые фразы доставки, чтобы они не дробили одинаковые лоты.
-    text = unicodedata.normalize("NFKC", f"{title} {description}").casefold()
-    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
-    text = re.sub(
-        r"\b(fast delivery|instant delivery|quick delivery|safe trade|"
-        r"быстрая доставка|мгновенная выдача|пишите в чат|пишите продавцу)\b",
-        " ", text,
+            stamp = int(value)
+            return stamp / 1000 if stamp > 10**12 else float(stamp)
+        except ValueError:
+            return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        pass
+    lowered = value.lower().replace("ё", "е")
+    if "только что" in lowered or "сейчас" in lowered:
+        return time.time()
+    match = re.search(
+        r"(\d+)\s*(секунд\w*|сек\.?|минут\w*|мин\.?|час\w*|дн\w*|день)\s*назад",
+        lowered,
     )
-    text = re.sub(r"[\W_]+", " ", text, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", text).strip()
+    if match:
+        n = int(match.group(1))
+        unit = match.group(2)
+        factor = 1 if unit.startswith("сек") else 60 if unit.startswith("мин") else 3600 if unit.startswith("час") else 86400
+        return time.time() - n * factor
+    return None
 
 
-def fetch_detail(session, link):
-    now = time.time()
-    cached = DETAIL_CACHE.get(link)
-    if cached and now - cached[0] < DETAIL_CACHE_TTL:
-        return cached[1]
+def extract_published_time(row):
+    candidates = []
+    for element in row.select("time,[data-time],[data-timestamp],[datetime]"):
+        for attr in ("datetime", "data-time", "data-timestamp", "title"):
+            if element.get(attr):
+                candidates.append(element.get(attr))
+        text = element.get_text(" ", strip=True)
+        if text:
+            candidates.append(text)
+    text = row.get_text(" ", strip=True)
+    match = re.search(
+        r"(только что|\d+\s*(?:секунд\w*|сек\.?|минут\w*|мин\.?|час\w*|дн\w*|день)\s*назад)",
+        text.lower().replace("ё", "е"),
+    )
+    if match:
+        candidates.append(match.group(1))
+    for candidate in candidates:
+        parsed = parse_published_time(candidate)
+        if parsed is not None:
+            return parsed
+    return None
 
-    response = session.get(link, timeout=20)
+
+def fetch_offers():
+    response = requests.get(
+        CATEGORY_URL,
+        headers=HEADERS,
+        cookies={"cy": "rub", "locale": "ru"},
+        timeout=25,
+    )
     response.raise_for_status()
-    description = get_description(BeautifulSoup(response.text, "html.parser"))
-    if description:
-        DETAIL_CACHE[link] = (now, description)
-    return description
+    soup = BeautifulSoup(response.text, "html.parser")
+    rows = soup.select("a.tc-item")
+    offers = []
+    skipped_currency = 0
 
-
-def parse_card(row):
-    price_node = row.select_one(".tc-price")
-    if not price_node:
-        return None
-    price_text = clean(price_node.get_text(" ", strip=True))
-    if not any(mark in price_text.casefold() for mark in ("₽", "руб", "rub")):
-        return None
-    price = number(price_text)
-    if price is None or price <= 0:
-        return None
-
-    href = row.get("href")
-    if not href:
-        return None
-    link = urljoin(CATEGORY_URL, href)
-    parsed = urlparse(link)
-    if parsed.scheme not in ("http", "https") or parsed.netloc not in (
-        "funpay.com", "www.funpay.com"
-    ):
-        return None
-
-    title_node = row.select_one(".tc-desc-text") or row
-    seller_node = row.select_one(".media-user-name")
-    return {
-        "id": get_offer_id(link),
-        "title": clean(title_node.get_text(" ", strip=True))[:240],
-        "price": price,
-        "seller": clean(seller_node.get_text(" ", strip=True)) if seller_node else "Не указан",
-        "link": link,
-    }
-
-
-def scan_market():
-    """Собирает публичные лоты, читает описания и сравнивает похожие группы."""
-    session = requests.Session()
-    session.headers.update(SESSION_HEADERS)
-    session.cookies.update({"cy": "rub", "locale": "ru"})
-
-    response = session.get(CATEGORY_URL, timeout=25)
-    response.raise_for_status()
-    first_soup = BeautifulSoup(response.text, "html.parser")
-    pages = [None] + [p for p in pagination_pages(first_soup) if p != 0]
-
-    cards = {}
-    for page in pages[:MAX_PAGES]:
-        if page is None:
-            soup = first_soup
-        else:
-            page_response = session.get(page_url(page), timeout=25)
-            page_response.raise_for_status()
-            soup = BeautifulSoup(page_response.text, "html.parser")
-
-        for row in soup.select("a.tc-item"):
-            card = parse_card(row)
-            if card:
-                cards[card["id"]] = card
-        time.sleep(REQUEST_DELAY)
-
-    all_cards = list(cards.values())
-    detailed = []
-    inspected = 0
-
-    for card in all_cards:
-        if inspected >= MAX_DETAILS_PER_SCAN:
-            break
-        try:
-            description = fetch_detail(session, card["link"])
-            inspected += 1
-            if not description:
-                continue
-            signature = normalize_signature(card["title"], description)
-            if len(signature.split()) < 2:
-                continue
-            card["description"] = description[:1800]
-            card["signature"] = signature
-            detailed.append(card)
-        except requests.RequestException as exc:
-            log.warning("Не удалось прочитать лот %s: %s", card["id"], exc)
-        time.sleep(REQUEST_DELAY)
-
-    groups = {}
-    for item in detailed:
-        groups.setdefault(item["signature"], []).append(item)
-
-    results = []
-    for group in groups.values():
-        if len(group) < MIN_COMPARABLES:
+    for row in rows:
+        price_el = row.select_one(".tc-price")
+        amount_el = row.select_one(".tc-amount")
+        if not price_el or not amount_el:
             continue
-        prices = [item["price"] for item in group]
-        # Медиана устойчивее к единичным аномальным ценам.
-        market_price = statistics.median(prices)
-        if market_price <= 0:
+
+        price_text = price_el.get_text(" ", strip=True)
+        low = price_text.lower()
+        if not any(x in low for x in ("₽", "руб", "rub")):
+            skipped_currency += 1
             continue
-        for item in group:
-            discount = (market_price - item["price"]) / market_price * 100
-            results.append({
-                **item,
-                "market_price": market_price,
-                "discount": discount,
-                "sample_size": len(group),
-            })
 
-    log.info(
-        "Сканирование: карточек=%s, описаний=%s, групп=%s, сравнений=%s",
-        len(all_cards), inspected, len(groups), len(results),
-    )
-    return {
-        "offers": results,
-        "cards_found": len(all_cards),
-        "details_read": inspected,
-        "groups_found": len(groups),
-    }
+        price = parse_number(price_text)
+        amount_value = parse_number(amount_el.get_text(" ", strip=True))
+        if price is None or amount_value is None:
+            continue
 
+        href = row.get("href")
+        if not href:
+            continue
+        link = urljoin(CATEGORY_URL, href)
+        parsed = urlparse(link)
+        if parsed.scheme not in ("http", "https") or parsed.netloc not in ("funpay.com", "www.funpay.com"):
+            continue
 
-# ---------------- TELEGRAM UI ----------------
+        offer_id = parse_qs(parsed.query).get("id", [parsed.path])[0]
+        seller_el = row.select_one(".media-user-name")
+        platform_el = row.select_one(".tc-server") or row.select_one(".tc-side") or row.select_one(".tc-desc-text")
 
-def money(value):
-    return f"{value:,.2f}".replace(",", " ").replace(".", ",")
+        offers.append({
+            "id": str(offer_id),
+            "price": price,
+            "amount": int(amount_value),
+            "platform": platform_el.get_text(" ", strip=True) if platform_el else "Не указана",
+            "seller": seller_el.get_text(" ", strip=True) if seller_el else "Не указан",
+            "link": link,
+            "published_at": extract_published_time(row),
+        })
 
-
-def settings_message(user_id):
-    min_price, max_price, discount, interval = get_settings(user_id)
-    interval_label = next(
-        (label for label, seconds in INTERVALS.items() if seconds == interval),
-        f"{interval} сек.",
-    )
-    return (
-        "📊 <b>ТВОИ ПАРАМЕТРЫ</b>\n"
-        f"🎮 Категория: <b>{CATEGORY_NAME}</b>\n"
-        f"💰 Минимальная цена: <b>{money(min_price)} ₽</b>\n"
-        f"💵 Максимальная цена: <b>{money(max_price)} ₽</b>\n"
-        f"🎯 Минимальная скидка: <b>{discount:.0f}%</b>\n"
-        f"🔄 Интервал: <b>{html.escape(interval_label)}</b>\n"
-        f"📚 Для оценки нужно минимум: <b>{MIN_COMPARABLES} похожих лота</b>"
-    )
+    log.info("FunPay: карточек=%d, рублёвых объявлений=%d", len(rows), len(offers))
+    if not offers and rows and skipped_currency:
+        raise ValueError("FunPay вернул цены не в рублях. Проверь валюту страницы.")
+    return offers
 
 
-def filter_results(user_id, scan):
-    min_price, max_price, discount, _ = get_settings(user_id)
-    found = [
-        item for item in scan["offers"]
-        if min_price <= item["price"] <= max_price
-        and item["discount"] >= discount
+# ---------------- SEARCH AND MESSAGES ----------------
+
+def matching_offers(user_id, offers):
+    min_price, max_price, min_amount, max_amount, _ = get_settings(user_id)
+    result = [
+        offer for offer in offers
+        if min_price <= offer["price"] <= max_price
+        and min_amount <= offer["amount"] <= max_amount
     ]
-    found.sort(key=lambda x: (-x["discount"], x["price"]))
-    return found
+    return sorted(result, key=lambda item: item["price"])
 
 
-def offer_text(item):
-    return (
-        "💎 <b>ВОЗМОЖНО ВЫГОДНОЕ ПРЕДЛОЖЕНИЕ</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🧩 <b>{html.escape(item['title'][:180])}</b>\n"
-        f"💰 Цена: <b>{money(item['price'])} ₽</b>\n"
-        f"📊 Оценка рынка: <b>{money(item['market_price'])} ₽</b>\n"
-        f"📉 Ниже оценки: <b>{item['discount']:.1f}%</b>\n"
-        f"🔎 Похожих объявлений: <b>{item['sample_size']}</b>\n"
-        f"👤 Продавец: <b>{html.escape(item['seller'])}</b>\n"
-        f"📝 Описание: {html.escape(item['description'][:700])}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "Оценка рассчитана по похожим публичным объявлениям. "
-        "Перед покупкой проверь характеристики вручную."
-    )
+def fmt(value):
+    return f"{value:.3f}".rstrip("0").rstrip(".").replace(".", ",")
 
 
-def offer_keyboard(item):
+def safe(value):
+    return html.escape(str(value or "Не указан"), quote=True)
+
+
+def offer_keyboard(offer):
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Открыть объявление на FunPay", url=item["link"])
+        InlineKeyboardButton("🛒 Открыть на FunPay", url=offer["link"]),
+        InlineKeyboardButton("Пропустить", callback_data=f"skip:{offer['id'][:40]}"),
     ]])
 
 
-async def send_scan(message, user_id):
-    await message.reply_text("🔎 Сканирую публичные объявления FunPay…")
+def offer_message(offer, number=None, recent=False):
+    if recent:
+        heading = "🕑 <b>ОБЪЯВЛЕНИЕ ЗА ПОСЛЕДНИЕ 2 МИНУТЫ</b>"
+    elif number is not None:
+        heading = f"🆕 <b>ОБЪЯВЛЕНИЕ №{number}</b>"
+    else:
+        heading = "🪙 <b>НОВОЕ ОБЪЯВЛЕНИЕ FUNPAY</b>"
+    return (
+        f"{heading}\n━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Цена: <b>{fmt(offer['price'])} ₽ за 1 Gold</b>\n"
+        f"📦 Количество: <b>{offer['amount']} Gold</b>\n"
+        f"📱 Платформа: <b>{safe(offer['platform'])}</b>\n"
+        f"👤 Продавец: <b>{safe(offer['seller'])}</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Нажми кнопку, чтобы открыть объявление. Покупку и оплату выполняй самостоятельно."
+    )
+
+
+def settings_text(user_id, context):
+    min_p, max_p, min_a, max_a, interval = get_settings(user_id)
+    duration = context.user_data.get("monitor_duration", DEFAULT_DURATION)
+    running = context.application.bot_data.setdefault(MONITORS_KEY, {}).get(user_id)
+    is_running = bool(running and not running.done())
+    expiry = access_expiry(user_id)
+    access_line = "👑 Владелец" if user_id == OWNER_ID else (
+        "🔐 Доступ до " + datetime.fromtimestamp(expiry, timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        if expiry else "🔒 Нет активного доступа"
+    )
+    duration_label = next((k for k, v in DURATIONS.items() if v == duration), "15 минут")
+    interval_label = next((k for k, v in INTERVALS.items() if v == interval), f"{interval} сек.")
+    return (
+        "⚙️ <b>ТВОИ НАСТРОЙКИ</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Цена за 1 Gold: <b>{fmt(min_p)}–{fmt(max_p)} ₽</b>\n"
+        f"📦 Количество: <b>{min_a}–{max_a} Gold</b>\n"
+        f"⏱ Длительность: <b>{duration_label}</b>\n"
+        f"🔄 Интервал: <b>{interval_label}</b>\n"
+        f"📡 Мониторинг: <b>{'🟢 Работает' if is_running else '⚪ Остановлен'}</b>\n"
+        f"{access_line}"
+    )
+
+
+async def send_search_results(message, user_id):
+    await message.reply_text("🔎 Ищу объявления на публичной странице FunPay…", reply_markup=MAIN_MENU)
     try:
-        scan = await asyncio.to_thread(scan_market)
-        matches = filter_results(user_id, scan)
-    except Exception as exc:
-        log.exception("Ошибка сканирования")
+        offers = await asyncio.to_thread(fetch_offers)
+        matches = matching_offers(user_id, offers)
+    except Exception as error:
+        log.exception("Ошибка поиска")
         await message.reply_text(
-            f"Не удалось завершить сканирование: {type(exc).__name__}: {exc}",
+            f"⚠️ Не удалось выполнить поиск: {type(error).__name__}: {error}",
             reply_markup=MAIN_MENU,
         )
         return
-
-    await message.reply_text(
-        "📊 <b>ОТЧЁТ СКАНИРОВАНИЯ</b>\n"
-        f"Карточек найдено: <b>{scan['cards_found']}</b>\n"
-        f"Описаний прочитано: <b>{scan['details_read']}</b>\n"
-        f"Групп характеристик: <b>{scan['groups_found']}</b>\n"
-        f"Под твои фильтры: <b>{len(matches)}</b>\n\n"
-        "Если карточек больше, чем удалось проверить, сканер ограничивает "
-        "объём запросов за один проход.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_MENU,
-    )
-
-    for item in matches[:15]:
+    if not matches:
         await message.reply_text(
-            offer_text(item),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=offer_keyboard(item),
-        )
-
-
-async def notify_loop(app, user_id, stop_event):
-    _, _, _, interval = get_settings(user_id)
-    try:
-        await app.bot.send_message(
-            user_id,
-            "🟢 Мониторинг запущен. Проверяю публичные объявления.",
+            "😕 Подходящих объявлений нет. Попробуй изменить фильтры.",
             reply_markup=MAIN_MENU,
         )
-        while not stop_event.is_set():
+        return
+    await message.reply_text(f"✅ Найдено объявлений: {len(matches)}", reply_markup=MAIN_MENU)
+    for index, offer in enumerate(matches[:20], start=1):
+        await message.reply_text(
+            offer_message(offer, index),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=offer_keyboard(offer),
+        )
+
+
+# ---------------- MONITORING ----------------
+
+async def monitor_loop(application, user_id, duration, interval, stop_event):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + duration
+    try:
+        await application.bot.send_message(
+            user_id,
+            f"🟢 Мониторинг запущен на {duration // 60} мин. Проверка каждые {interval} сек.",
+            reply_markup=MAIN_MENU,
+        )
+        while not stop_event.is_set() and loop.time() < deadline:
             try:
-                scan = await asyncio.to_thread(scan_market)
-                matches = filter_results(user_id, scan)
-                for item in matches:
+                offers = await asyncio.to_thread(fetch_offers)
+                matches = matching_offers(user_id, offers)
+                for offer in matches:
                     if stop_event.is_set():
                         break
-                    if not seen(user_id, item["id"]):
-                        await app.bot.send_message(
+                    if not is_seen(user_id, offer["id"]):
+                        await application.bot.send_message(
                             user_id,
-                            offer_text(item),
+                            offer_message(offer),
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True,
-                            reply_markup=offer_keyboard(item),
+                            reply_markup=offer_keyboard(offer),
                         )
-                        mark_seen(user_id, item["id"])
+                        mark_seen(user_id, offer["id"])
+                        log_action(user_id, offer["id"], "notified")
             except Exception:
-                log.exception("Ошибка фонового сканирования")
-                await app.bot.send_message(
-                    user_id,
-                    "⚠️ Ошибка проверки FunPay. Попробую ещё раз позже.",
+                log.exception("Ошибка проверки FunPay")
+                await application.bot.send_message(
+                    user_id, "⚠️ Ошибка проверки FunPay. Повторю попытку позже."
                 )
-
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                await asyncio.wait_for(stop_event.wait(), timeout=min(interval, remaining))
             except asyncio.TimeoutError:
                 pass
+        text = "⛔ Мониторинг остановлен." if stop_event.is_set() else "🏁 Время мониторинга закончилось."
+        await application.bot.send_message(user_id, text, reply_markup=MAIN_MENU)
     finally:
-        MONITORS.pop(user_id, None)
-        await app.bot.send_message(user_id, "⛔ Мониторинг остановлен.")
+        tasks = application.bot_data.setdefault(MONITORS_KEY, {})
+        stops = application.bot_data.setdefault(STOPS_KEY, {})
+        if tasks.get(user_id) is asyncio.current_task():
+            tasks.pop(user_id, None)
+            stops.pop(user_id, None)
 
 
 async def start_monitor(update, context):
     user_id = update.effective_user.id
-    if user_id in MONITORS and not MONITORS[user_id]["task"].done():
-        await update.message.reply_text("Мониторинг уже запущен.")
+    tasks = context.application.bot_data.setdefault(MONITORS_KEY, {})
+    stops = context.application.bot_data.setdefault(STOPS_KEY, {})
+    current = tasks.get(user_id)
+    if current and not current.done():
+        await update.message.reply_text("⚠️ Мониторинг уже запущен.", reply_markup=MAIN_MENU)
         return
+    duration = context.user_data.get("monitor_duration", DEFAULT_DURATION)
+    interval = get_settings(user_id)[4]
     stop_event = asyncio.Event()
-    task = context.application.create_task(
-        notify_loop(context.application, user_id, stop_event)
+    stops[user_id] = stop_event
+    tasks[user_id] = context.application.create_task(
+        monitor_loop(context.application, user_id, duration, interval, stop_event)
     )
-    MONITORS[user_id] = {"task": task, "stop": stop_event}
-    await update.message.reply_text("Запускаю мониторинг…", reply_markup=MAIN_MENU)
+    await update.message.reply_text("⏳ Запускаю мониторинг…", reply_markup=MAIN_MENU)
 
 
 async def stop_monitor(update, context):
-    entry = MONITORS.get(update.effective_user.id)
-    if entry:
-        entry["stop"].set()
-        await update.message.reply_text("Останавливаю мониторинг…", reply_markup=MAIN_MENU)
+    stop_event = context.application.bot_data.setdefault(STOPS_KEY, {}).get(update.effective_user.id)
+    if stop_event:
+        stop_event.set()
+        await update.message.reply_text("⏳ Останавливаю мониторинг…", reply_markup=MAIN_MENU)
     else:
         await update.message.reply_text("Мониторинг сейчас не запущен.", reply_markup=MAIN_MENU)
 
 
-# ---------------- SETTINGS INPUT ----------------
-
-async def start_setting(update, context, field):
-    context.user_data["setting"] = field
-    prompts = {
-        "discount": "Введи минимальную скидку в процентах (например, 40).",
-        "min_price": "Введи минимальную цену в рублях.",
-        "max_price": "Введи максимальную цену в рублях.",
-        "interval": "Выбери интервал: 1 минута, 3 минуты, 5 минут или 10 минут.",
-    }
-    await update.message.reply_text(prompts[field], reply_markup=SETTINGS_MENU)
-
-
-async def handle_setting_value(update, context):
-    field = context.user_data.get("setting")
-    if not field:
-        return False
-
-    raw = update.message.text.strip().replace(",", ".")
+async def test_monitor(update, context):
     user_id = update.effective_user.id
+    await update.message.reply_text("🧪 Проверяю FunPay и твои фильтры…")
+    try:
+        offers = await asyncio.to_thread(fetch_offers)
+        matches = matching_offers(user_id, offers)
+        recent = [x for x in matches if x.get("published_at") and 0 <= time.time() - x["published_at"] <= RECENT_SECONDS]
+        await update.message.reply_text(
+            f"✅ FunPay доступен.\n"
+            f"Объявлений в рублях: {len(offers)}\n"
+            f"Подходят под фильтры: {len(matches)}\n"
+            f"Опубликовано примерно за 2 минуты: {len(recent)}",
+            reply_markup=MAIN_MENU,
+        )
+    except Exception as exc:
+        await update.message.reply_text(
+            f"⚠️ Проверка не прошла: {type(exc).__name__}: {exc}",
+            reply_markup=MAIN_MENU,
+        )
 
-    if field == "interval":
-        if raw not in INTERVALS:
-            await update.message.reply_text("Выбери один из предложенных интервалов.")
-            return True
-        save_settings(user_id, interval=INTERVALS[raw])
-    else:
-        try:
-            value = float(raw)
-        except ValueError:
-            await update.message.reply_text("Введи число.")
-            return True
 
-        if value < 0:
-            await update.message.reply_text("Значение не может быть отрицательным.")
-            return True
+# ---------------- SETTINGS UI ----------------
 
-        min_price, max_price, discount, interval = get_settings(user_id)
-        if field == "discount":
-            if not 1 <= value <= 95:
-                await update.message.reply_text("Скидка должна быть от 1 до 95%.")
-                return True
-            save_settings(user_id, discount=value)
-        elif field == "min_price":
-            if value <= 0 or value > max_price:
-                await update.message.reply_text("Минимальная цена должна быть больше 0 и не выше максимальной.")
-                return True
-            save_settings(user_id, min_price=value)
-        elif field == "max_price":
-            if value < min_price:
-                await update.message.reply_text("Максимальная цена не может быть меньше минимальной.")
-                return True
-            save_settings(user_id, max_price=value)
-
-    context.user_data.pop("setting", None)
+async def begin_setting(update, context, setting):
+    context.user_data["setting"] = setting
+    context.user_data.pop("temp_min", None)
+    prompts = {
+        "price_min": "💰 Введи минимальную цену за 1 Gold (например, 0.10).",
+        "amount_min": "📦 Введи минимальное количество Gold (например, 10).",
+    }
     await update.message.reply_text(
-        "✅ Настройка сохранена.\n\n" + settings_message(user_id),
-        parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_MENU,
+        prompts[setting] + "\nДля отмены нажми «⬅️ Главное меню».",
+        reply_markup=SETTINGS_MENU,
     )
+
+
+async def receive_setting_value(update, context):
+    setting = context.user_data.get("setting")
+    if not setting:
+        return False
+    user_id = update.effective_user.id
+    raw = update.message.text.strip().replace(",", ".")
+    try:
+        if setting.startswith("price"):
+            value = float(raw)
+            if value <= 0:
+                raise ValueError
+        else:
+            value = int(raw)
+            if value < 1:
+                raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введи корректное положительное число.")
+        return True
+
+    if setting == "price_min":
+        context.user_data["temp_min"] = value
+        context.user_data["setting"] = "price_max"
+        await update.message.reply_text("Теперь введи максимальную цену за 1 Gold.")
+    elif setting == "price_max":
+        minimum = context.user_data["temp_min"]
+        if value < minimum:
+            await update.message.reply_text("Максимальная цена не может быть меньше минимальной.")
+            return True
+        save_setting(user_id, "min_price", minimum)
+        save_setting(user_id, "max_price", value)
+        context.user_data.pop("setting", None)
+        context.user_data.pop("temp_min", None)
+        await update.message.reply_text(
+            "✅ Диапазон цены сохранён!\n\n" + settings_text(user_id, context),
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_MENU,
+        )
+    elif setting == "amount_min":
+        context.user_data["temp_min"] = value
+        context.user_data["setting"] = "amount_max"
+        await update.message.reply_text("Теперь введи максимальное количество Gold.")
+    elif setting == "amount_max":
+        minimum = context.user_data["temp_min"]
+        if value < minimum:
+            await update.message.reply_text("Максимальное количество не может быть меньше минимального.")
+            return True
+        save_setting(user_id, "min_amount", minimum)
+        save_setting(user_id, "max_amount", value)
+        context.user_data.pop("setting", None)
+        context.user_data.pop("temp_min", None)
+        await update.message.reply_text(
+            "✅ Количество сохранено!\n\n" + settings_text(user_id, context),
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_MENU,
+        )
     return True
 
 
-# ---------------- COMMANDS ----------------
+# ---------------- ACCESS KEYS / ADMIN ----------------
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text(
-            "Доступ закрыт. Попроси владельца бота выдать доступ."
-        )
+    if allowed_user(user_id):
+        await update.message.reply_text("У тебя уже есть активный доступ.", reply_markup=MAIN_MENU)
         return
-    ensure_user(user_id)
+    if not context.args:
+        await update.message.reply_text("Формат: /activate ТВОЙ_КЛЮЧ")
+        return
+
+    digest = key_digest(context.args[0].strip())
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT expires_at FROM access_keys WHERE key_hash=?", (digest,)
+        ).fetchone()
+        if not row:
+            await update.message.reply_text("❌ Ключ неверный или уже использован.")
+            return
+        expires_at = float(row[0])
+        if expires_at <= time.time():
+            db.execute("DELETE FROM access_keys WHERE key_hash=?", (digest,))
+            await update.message.reply_text("⌛ Срок действия ключа закончился. Попроси новый.")
+            return
+        db.execute("DELETE FROM access_keys WHERE key_hash=?", (digest,))
+        db.execute(
+            "INSERT OR REPLACE INTO authorized_users(user_id,activated_at,expires_at) VALUES(?,?,?)",
+            (user_id, time.time(), expires_at),
+        )
+
+    ensure_settings(user_id)
+    expiry_text = datetime.fromtimestamp(expires_at, timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
     await update.message.reply_text(
-        "💎 <b>FUNPAY BRAINROT SCANNER</b>\n"
-        "Сканирую публичные объявления категории Steal a Brainrot.\n"
-        "Сравниваю описание и характеристики; не считаю цену рынка, "
-        "если похожих объявлений меньше трёх.\n\n"
-        "Покупку и оплату ты выполняешь самостоятельно.",
+        f"✅ <b>ДОСТУП АКТИВИРОВАН</b>\nДействует до: <b>{expiry_text}</b>\nНажми /start.",
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_MENU,
     )
 
 
-async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    key = secrets.token_urlsafe(12)
+    created = time.time()
+    expires = created + 24 * 60 * 60
+    with db_connect() as db:
+        db.execute(
+            "INSERT INTO access_keys(key_hash,expires_at,created_at) VALUES(?,?,?)",
+            (key_digest(key), expires, created),
+        )
+    expiry_text = datetime.fromtimestamp(expires, timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    await update.message.reply_text(
+        "🔑 <b>НОВЫЙ КЛЮЧ СОЗДАН</b>\n"
+        f"<code>{safe(key)}</code>\n\n"
+        "⏳ Ключ действует 24 часа с момента создания.\n"
+        f"⌛ Истекает: <b>{expiry_text}</b>\n"
+        "Ключ одноразовый. Пользователь активирует его командой /activate.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    with db_connect() as db:
+        rows = db.execute(
+            "SELECT user_id,expires_at FROM authorized_users ORDER BY expires_at DESC"
+        ).fetchall()
+    now = time.time()
+    lines = ["👥 <b>ПОЛЬЗОВАТЕЛИ С ДОСТУПОМ</b>"]
+    for uid, expires in rows:
+        state = "активен" if expires > now else "истёк"
+        exp_text = datetime.fromtimestamp(expires, timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        lines.append(f"• <code>{uid}</code> — {state}, до {exp_text}")
+    if len(lines) == 1:
+        lines.append("Пока никому не выдан доступ.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def revoke_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not context.args:
-        await update.message.reply_text("Использование: /grant TELEGRAM_ID")
+        await update.message.reply_text("Формат: /revoke TELEGRAM_ID")
         return
     try:
         target = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("ID должен быть числом.")
+        await update.message.reply_text("Telegram ID должен быть числом.")
         return
-    set_authorized(target, True)
-    ensure_user(target)
-    await update.message.reply_text(f"Доступ выдан: {target}")
+    if target == OWNER_ID:
+        await update.message.reply_text("Нельзя отзывать доступ у владельца.")
+        return
+    with db_connect() as db:
+        db.execute("DELETE FROM authorized_users WHERE user_id=?", (target,))
+    stop = context.application.bot_data.setdefault(STOPS_KEY, {}).get(target)
+    if stop:
+        stop.set()
+    await update.message.reply_text(f"Доступ пользователя {target} отозван.")
 
 
-async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID or not context.args:
+async def action_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not allowed_user(user_id):
         return
-    try:
-        target = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("ID должен быть числом.")
+    with db_connect() as db:
+        rows = db.execute(
+            "SELECT offer_id,action,created_at FROM action_history WHERE user_id=? ORDER BY id DESC LIMIT 10",
+            (user_id,),
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("История действий пока пуста.")
         return
-    set_authorized(target, False)
-    if target in MONITORS:
-        MONITORS[target]["stop"].set()
-    await update.message.reply_text(f"Доступ отозван: {target}")
+    lines = ["📜 <b>ПОСЛЕДНИЕ УВЕДОМЛЕНИЯ</b>"]
+    for offer_id, action, created in rows:
+        stamp = datetime.fromtimestamp(created, timezone.utc).strftime("%d.%m %H:%M UTC")
+        lines.append(f"• {safe(action)} · лот <code>{safe(offer_id)}</code> · {stamp}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------------- COMMANDS AND MENU ----------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not allowed_user(user_id):
+        await update.message.reply_text(
+            "🔐 <b>ДОСТУП ЗАКРЫТ</b>\n"
+            "Попроси администратора выдать ключ на 24 часа.\n"
+            "Когда получишь ключ, введи: /activate ТВОЙ_КЛЮЧ",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    ensure_settings(user_id)
+    context.user_data.setdefault("monitor_duration", DEFAULT_DURATION)
+    await update.message.reply_text(
+        "🪙 <b>STANDOFF 2 GOLD FINDER</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Выбери действие в меню:\n\n"
+        "🔎 <b>Найти объявления</b> — разовый поиск.\n"
+        "🚀 <b>Запустить мониторинг</b> — получать новые предложения.\n"
+        "⚙️ <b>Настройки</b> — изменить цену и количество Gold.\n"
+        "⏱ <b>Длительность</b> — выбрать время мониторинга.\n"
+        "📋 <b>Мои фильтры</b> — посмотреть настройки и срок доступа.\n\n"
+        "🔐 Доступ пользователей выдаётся по одноразовому ключу на 24 часа.\n"
+        "Покупку и оплату выполняй самостоятельно.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_MENU,
+    )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    if not allowed_user(user_id):
         return
     await update.message.reply_text(
-        settings_message(user_id), parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU
+        settings_text(user_id, context),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_MENU,
     )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_user(update.effective_user.id):
+        return
+    context.user_data.pop("setting", None)
+    context.user_data.pop("temp_min", None)
+    await update.message.reply_text("Настройка отменена.", reply_markup=MAIN_MENU)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "❔ <b>ПОМОЩЬ</b>\n\n"
+        "1. Нажми «🔎 Найти объявления» для разового поиска.\n"
+        "2. Настрой диапазон цены и количество Gold.\n"
+        "3. Выбери длительность и интервал мониторинга.\n"
+        "4. Нажми «🚀 Запустить мониторинг».\n"
+        "5. Чтобы завершить раньше, нажми «⛔ Остановить».\n\n"
+        "Администратор: /genkey — создать ключ на 24 часа; "
+        "/users — список пользователей; /revoke ID — отозвать доступ.\n"
+        "Пользователь: /activate КЛЮЧ — активировать ключ."
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+
+
+async def skip_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Объявление пропущено.")
+    offer_id = query.data.split(":", 1)[1] if ":" in query.data else ""
+    log_action(update.effective_user.id, offer_id, "пропущено")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    if not allowed_user(user_id):
         return
-
     text = update.message.text.strip()
-    if await handle_setting_value(update, context):
+
+    if text == "⬅️ Главное меню":
+        context.user_data.pop("setting", None)
+        context.user_data.pop("temp_min", None)
+        await update.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
         return
 
-    if text == "🔎 Найти выгодные":
-        await send_scan(update.message, user_id)
+    if await receive_setting_value(update, context):
+        return
+
+    if text == "🔎 Найти объявления":
+        context.user_data.pop("setting", None)
+        await send_search_results(update.message, user_id)
     elif text == "🚀 Запустить мониторинг":
+        context.user_data.pop("setting", None)
         await start_monitor(update, context)
     elif text == "⛔ Остановить":
         await stop_monitor(update, context)
+    elif text == "🧪 Тест мониторинга":
+        await test_monitor(update, context)
     elif text == "⚙️ Настройки":
-        await update.message.reply_text("Выбери параметр:", reply_markup=SETTINGS_MENU)
-    elif text == "🎯 Порог скидки":
-        await start_setting(update, context, "discount")
-    elif text == "💰 Мин. цена":
-        await start_setting(update, context, "min_price")
-    elif text == "💵 Макс. цена":
-        await start_setting(update, context, "max_price")
-    elif text == "🔄 Интервал":
-        await start_setting(update, context, "interval")
-    elif text == "📊 Мои параметры":
-        await status(update, context)
-    elif text == "🧪 Проверить FunPay":
-        await update.message.reply_text("Проверяю доступность категории…")
-        try:
-            result = await asyncio.to_thread(
-                lambda: requests.get(CATEGORY_URL, headers=SESSION_HEADERS, timeout=20)
-            )
-            await update.message.reply_text(
-                f"HTTP: {result.status_code}\nURL: {result.url}",
-                reply_markup=MAIN_MENU,
-            )
-        except Exception as exc:
-            await update.message.reply_text(
-                f"Проверка не прошла: {type(exc).__name__}: {exc}",
-                reply_markup=MAIN_MENU,
-            )
-    elif text == "⬅️ Главное меню":
         context.user_data.pop("setting", None)
-        await update.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+        await update.message.reply_text("Выбери, что изменить:", reply_markup=SETTINGS_MENU)
+    elif text == "💰 Изменить цену":
+        await begin_setting(update, context, "price_min")
+    elif text == "📦 Изменить количество":
+        await begin_setting(update, context, "amount_min")
+    elif text == "🔄 Интервал обновления":
+        current = get_settings(user_id)[4]
+        label = next((k for k, v in INTERVALS.items() if v == current), "15 секунд")
+        await update.message.reply_text(
+            f"Сейчас интервал: <b>{label}</b>\nВыбери новый интервал:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=INTERVAL_MENU,
+        )
+        context.user_data["choosing_interval"] = True
+    elif text in INTERVALS:
+        if not context.user_data.get("choosing_interval"):
+            await update.message.reply_text("Открой «Настройки» → «Интервал обновления».")
+            return
+        save_setting(user_id, "check_interval", INTERVALS[text])
+        context.user_data.pop("choosing_interval", None)
+        await update.message.reply_text(
+            f"✅ Интервал установлен: {text}. Новое значение применится при следующем запуске.",
+            reply_markup=MAIN_MENU,
+        )
+    elif text == "⏱ Длительность":
+        await update.message.reply_text("Выбери длительность мониторинга:", reply_markup=DURATION_MENU)
+    elif text in DURATIONS:
+        context.user_data["monitor_duration"] = DURATIONS[text]
+        await update.message.reply_text(
+            f"✅ Длительность установлена: {text}. Теперь нажми «🚀 Запустить мониторинг».",
+            reply_markup=MAIN_MENU,
+        )
+    elif text == "📋 Мои фильтры":
+        await status(update, context)
+    elif text == "❔ Помощь":
+        await help_command(update, context)
     else:
-        await update.message.reply_text("Используй кнопки меню.", reply_markup=MAIN_MENU)
+        await update.message.reply_text("Выбери действие с помощью кнопок меню.", reply_markup=MAIN_MENU)
 
 
 def main():
@@ -736,16 +891,20 @@ def main():
         raise RuntimeError("Добавь OWNER_ID в переменные окружения.")
 
     init_db()
-    set_authorized(OWNER_ID, True)
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("grant", grant))
-    app.add_handler(CommandHandler("revoke", revoke))
+    app.add_handler(CommandHandler("activate", activate))
+    app.add_handler(CommandHandler("genkey", genkey))
+    app.add_handler(CommandHandler("users", users_list))
+    app.add_handler(CommandHandler("revoke", revoke_user))
+    app.add_handler(CommandHandler("history", action_history))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(skip_offer, pattern=r"^skip:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    log.info("Brainrot scanner started")
+    log.info("Standoff 2 Gold Finder запущен")
     app.run_polling(drop_pending_updates=True)
 
 
