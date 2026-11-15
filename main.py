@@ -34,7 +34,16 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DB_NAME = "settings.db"
 CATEGORY_URL = "https://funpay.com/chips/140/"
 
-CHECK_INTERVAL = 15
+DEFAULT_CHECK_INTERVAL = 15
+CHECK_INTERVALS = {
+    5: "5 секунд",
+    10: "10 секунд",
+    15: "15 секунд",
+    30: "30 секунд",
+    60: "1 минута",
+    120: "2 минуты",
+}
+
 MONITOR_KEY = "monitor_task"
 STOP_KEY = "monitor_stop"
 
@@ -48,6 +57,7 @@ DURATIONS = {
 }
 
 DURATION_LABELS = {v: k for k, v in DURATIONS.items()}
+INTERVAL_LABELS = {v: k for k, v in CHECK_INTERVALS.items()}
 
 
 # ---------------- КЛАВИАТУРЫ ----------------
@@ -66,6 +76,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
 SETTINGS_MENU = ReplyKeyboardMarkup(
     [
         ["💰 Изменить цену", "📦 Изменить количество"],
+        ["🔄 Интервал обновления"],
         ["⬅️ Главное меню"],
     ],
     resize_keyboard=True,
@@ -77,6 +88,17 @@ DURATION_MENU = ReplyKeyboardMarkup(
         ["5 минут", "15 минут"],
         ["30 минут", "1 час"],
         ["2 часа", "6 часов"],
+        ["⬅️ Главное меню"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+INTERVAL_MENU = ReplyKeyboardMarkup(
+    [
+        ["5 секунд", "10 секунд"],
+        ["15 секунд", "30 секунд"],
+        ["1 минута", "2 минуты"],
         ["⬅️ Главное меню"],
     ],
     resize_keyboard=True,
@@ -97,6 +119,19 @@ def init_db():
                 max_amount INTEGER DEFAULT 10000
             )
         """)
+
+        # Добавляем колонку интервала в старую базу,
+        # если её там ещё нет.
+        columns = {
+            row[1]
+            for row in db.execute("PRAGMA table_info(settings)")
+        }
+
+        if "check_interval" not in columns:
+            db.execute("""
+                ALTER TABLE settings
+                ADD COLUMN check_interval INTEGER DEFAULT 15
+            """)
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS seen_offers (
@@ -121,10 +156,25 @@ def get_settings(user_id):
         ).fetchone()
 
 
+def get_check_interval(user_id):
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute(
+            "INSERT OR IGNORE INTO settings (user_id) VALUES (?)",
+            (user_id,),
+        )
+        result = db.execute(
+            "SELECT check_interval FROM settings WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+    return result[0] if result and result[0] else DEFAULT_CHECK_INTERVAL
+
+
 def save_setting(user_id, field, value):
     allowed = {
         "min_price", "max_price",
         "min_amount", "max_amount",
+        "check_interval",
     }
 
     if field not in allowed:
@@ -182,6 +232,7 @@ def settings_text(user_id, context):
     running = task is not None and not task.done()
 
     duration = context.user_data.get("monitor_duration", 900)
+    interval = get_check_interval(user_id)
 
     monitor_status = (
         f"🟢 Работает ({DURATIONS[duration]})"
@@ -194,8 +245,8 @@ def settings_text(user_id, context):
         f"💰 Цена за 1 Gold: <b>{fmt(min_p)}–{fmt(max_p)} ₽</b>\n"
         f"📦 Количество: <b>{min_a}–{max_a} Gold</b>\n"
         f"⏱ Длительность: <b>{DURATIONS[duration]}</b>\n"
-        f"📡 Мониторинг: <b>{monitor_status}</b>\n"
-        "🔄 Проверка: <b>каждые 15 секунд</b>"
+        f"🔄 Интервал обновления: <b>{CHECK_INTERVALS.get(interval, str(interval) + ' секунд')}</b>\n"
+        f"📡 Мониторинг: <b>{monitor_status}</b>"
     )
 
 
@@ -304,8 +355,6 @@ def fetch_offers():
         )
 
         link = urljoin(CATEGORY_URL, href)
-
-        # ID объявления берём из пути ссылки
         parsed = urlparse(link)
         offer_id = parsed.path.rstrip("/")
 
@@ -459,7 +508,13 @@ async def send_search_results(message, user_id):
 
 # ---------------- МОНИТОРИНГ ----------------
 
-async def monitor_loop(application, user_id, duration, stop_event):
+async def monitor_loop(
+    application,
+    user_id,
+    duration,
+    interval,
+    stop_event,
+):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + duration
 
@@ -478,7 +533,7 @@ async def monitor_loop(application, user_id, duration, stop_event):
                 "🟢 <b>МОНИТОРИНГ ЗАПУЩЕН</b>\n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 f"⏱ Длительность: <b>{DURATIONS[duration]}</b>\n"
-                "🔄 Проверка: каждые <b>15 секунд</b>\n"
+                f"🔄 Проверка: каждые <b>{CHECK_INTERVALS[interval]}</b>\n"
                 f"📋 Уже существующих объявлений: <b>{len(initial)}</b>\n"
                 "🔔 Жду новые объявления."
             ),
@@ -535,7 +590,7 @@ async def monitor_loop(application, user_id, duration, stop_event):
                     chat_id=user_id,
                     text=(
                         "⚠️ Ошибка проверки FunPay. "
-                        "Повторю попытку через 15 секунд."
+                        f"Повторю попытку через {CHECK_INTERVALS[interval]}."
                     ),
                     reply_markup=MAIN_MENU,
                 )
@@ -547,7 +602,7 @@ async def monitor_loop(application, user_id, duration, stop_event):
             try:
                 await asyncio.wait_for(
                     stop_event.wait(),
-                    timeout=min(CHECK_INTERVAL, remaining),
+                    timeout=min(interval, remaining),
                 )
             except asyncio.TimeoutError:
                 pass
@@ -593,6 +648,7 @@ async def start_monitor(update, context):
         return
 
     duration = context.user_data.get("monitor_duration", 900)
+    interval = get_check_interval(user_id)
     stop_event = asyncio.Event()
 
     context.application.bot_data[STOP_KEY] = stop_event
@@ -602,13 +658,15 @@ async def start_monitor(update, context):
             context.application,
             user_id,
             duration,
+            interval,
             stop_event,
         )
     )
     context.application.bot_data[MONITOR_KEY] = task
 
     await update.message.reply_text(
-        f"⏳ Подготавливаю мониторинг на {DURATIONS[duration]}...",
+        f"⏳ Подготавливаю мониторинг на {DURATIONS[duration]}.\n"
+        f"Интервал проверки: {CHECK_INTERVALS[interval]}.",
         reply_markup=MAIN_MENU,
     )
 
@@ -748,6 +806,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     get_settings(user_id)
+    get_check_interval(user_id)
     context.user_data.setdefault("monitor_duration", 900)
 
     await update.message.reply_text(
@@ -757,7 +816,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔎 Поиск публичных объявлений FunPay\n"
         "💰 Фильтр по цене\n"
         "📦 Фильтр по количеству Gold\n"
-        "🚀 Мониторинг новых объявлений\n\n"
+        "🚀 Мониторинг новых объявлений\n"
+        "🔄 Настраиваемый интервал проверки\n\n"
         "Выбери действие в меню под строкой ввода.",
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_MENU,
@@ -829,6 +889,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "📦 Изменить количество":
         await begin_setting(update, context, "amount_min")
+        return
+
+    if text == "🔄 Интервал обновления":
+        context.user_data.pop("setting", None)
+        current = get_check_interval(user_id)
+        await update.message.reply_text(
+            "🔄 <b>ИНТЕРВАЛ ОБНОВЛЕНИЯ</b>\n\n"
+            f"Сейчас: <b>{CHECK_INTERVALS[current]}</b>\n\n"
+            "Выбери, как часто проверять FunPay:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=INTERVAL_MENU,
+        )
+        return
+
+    if text in INTERVAL_LABELS:
+        interval = INTERVAL_LABELS[text]
+        save_setting(user_id, "check_interval", interval)
+        context.user_data.pop("setting", None)
+
+        await update.message.reply_text(
+            f"✅ Интервал обновления установлен: <b>{text}</b>\n\n"
+            "Настройка сохранена. При следующем запуске мониторинга "
+            "будет использоваться новый интервал.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_MENU,
+        )
         return
 
     if text == "⏱ Длительность":
