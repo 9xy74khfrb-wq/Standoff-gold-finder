@@ -635,56 +635,82 @@ async def send_search_results(message, user_id):
 
 # ---------------- ДИАГНОСТИКА И ТЕСТ ----------------
 
-
 async def diagnostic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed_user(update.effective_user.id):
         return
-
     try:
         response = await asyncio.to_thread(fetch_page)
         soup = BeautifulSoup(response.text, "html.parser")
         rows = soup.select("a.tc-item")
-
         report = [
-            "🔬 ДИАГНОСТИКА ССЫЛОК FUNPAY",
+            "🔬 ДИАГНОСТИКА FUNPAY",
             f"HTTP: {response.status_code}",
+            f"Адрес: {response.url}",
             f"Карточек найдено: {len(rows)}",
             "",
         ]
-
         for index, row in enumerate(rows[:5], start=1):
-            seller_element = row.select_one(".media-user-name")
-            seller = (
-                seller_element.get_text(" ", strip=True)
-                if seller_element else "Не найден"
+            price_element = row.select_one(".tc-price")
+            amount_element = row.select_one(".tc-amount")
+            price_text = (
+                price_element.get_text(" ", strip=True)
+                if price_element else "Ценник не найден"
             )
-
-            report.append(f"Карточка {index}")
-            report.append(f"Продавец: {seller}")
-
-          
-            report.append(f"Продавец: {seller}")
-            report.append(f"Атрибуты ника: {seller_element.attrs if seller_element else 'Нет'}")
-            report.append(f"Атрибуты карточки: {row.attrs}")
-
-            if seller_element:
-                parent = seller_element
-                for level in range(1, 5):
-                    parent = parent.parent
-                    if not parent:
-                        break
-                    report.append(
-                        f"Родитель {level}: {parent.name}, "
-                        f"атрибуты: {parent.attrs}"
-                    )
-
-            user_matches = re.findall(
-                r".{0,100}(?:user_id|userId|userid|/users/).{0,150}",
-                response.text,
-                re.IGNORECASE,
+            amount_text = (
+                amount_element.get_text(" ", strip=True)
+                if amount_element else "Количество не найдено"
             )
-            report.append("Фрагменты с ID профилей:")
-            report.extend(user_matches[:5] or ["Не найдены"])
+            published_at = extract_published_time(row)
+            report.append(
+                f"Карточка {index}: цена {price_text!r}; "
+                f"количество {amount_text!r}; "
+                f"время: {published_at or 'не найдено'}"
+            )
+        await update.message.reply_text("\n".join(report))
+    except Exception as error:
+        await update.message.reply_text(
+            f"Ошибка диагностики: {type(error).__name__}: {error}"
+        )
+
+
+async def test_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        "🧪 Проверяю мониторинг, фильтры и отправку Telegram...",
+        reply_markup=MAIN_MENU,
+    )
+    try:
+        offers = await asyncio.to_thread(fetch_offers)
+        matches = matching_offers(user_id, offers)
+        recent = [offer for offer in offers if is_published_recently(offer)]
+        interval = get_check_interval(user_id)
+        report = (
+            "🧪 <b>РЕЗУЛЬТАТ ТЕСТА</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🟢 FunPay: страница доступна\n"
+            f"📋 Объявлений найдено: <b>{len(offers)}</b>\n"
+            f"🎯 Подходит под фильтры: <b>{len(matches)}</b>\n"
+            f"🕑 Опубликовано за 2 минуты: <b>{len(recent)}</b>\n"
+            f"🕒 Время публикации найдено у: "
+            f"<b>{sum(1 for item in offers if item.get('published_at') is not None)}</b>\n"
+            f"🔄 Интервал: <b>{CHECK_INTERVALS[interval]}</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🟢 Получение объявлений работает.\n"
+            "🟢 Фильтры проверены."
+        )
+        await update.message.reply_text(
+            report, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU
+        )
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="📨 Тестовое уведомление: отправка Telegram работает!",
+        )
+    except Exception as error:
+        logger.exception("Ошибка теста мониторинга")
+        await update.message.reply_text(
+            f"🔴 Тест не пройден: {type(error).__name__}: {error}",
+            reply_markup=MAIN_MENU,
+        )
 
 
 # ---------------- МОНИТОРИНГ ----------------
