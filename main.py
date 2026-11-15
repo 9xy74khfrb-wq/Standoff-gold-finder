@@ -35,6 +35,7 @@ DB_NAME = "settings.db"
 CATEGORY_URL = "https://funpay.com/chips/140/"
 
 DEFAULT_CHECK_INTERVAL = 15
+
 CHECK_INTERVALS = {
     5: "5 секунд",
     10: "10 секунд",
@@ -65,8 +66,9 @@ INTERVAL_LABELS = {v: k for k, v in CHECK_INTERVALS.items()}
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["🔎 Найти объявления", "🚀 Запустить"],
-        ["⛔ Остановить", "⚙️ Настройки"],
-        ["⏱ Длительность", "📋 Мои фильтры"],
+        ["⛔ Остановить", "🧪 Тест мониторинга"],
+        ["⚙️ Настройки", "📋 Мои фильтры"],
+        ["⏱ Длительность"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -120,8 +122,6 @@ def init_db():
             )
         """)
 
-        # Добавляем колонку интервала в старую базу,
-        # если её там ещё нет.
         columns = {
             row[1]
             for row in db.execute("PRAGMA table_info(settings)")
@@ -167,13 +167,20 @@ def get_check_interval(user_id):
             (user_id,),
         ).fetchone()
 
-    return result[0] if result and result[0] else DEFAULT_CHECK_INTERVAL
+    interval = result[0] if result else None
+
+    if interval not in CHECK_INTERVALS:
+        return DEFAULT_CHECK_INTERVAL
+
+    return interval
 
 
 def save_setting(user_id, field, value):
     allowed = {
-        "min_price", "max_price",
-        "min_amount", "max_amount",
+        "min_price",
+        "max_price",
+        "min_amount",
+        "max_amount",
         "check_interval",
     }
 
@@ -245,7 +252,7 @@ def settings_text(user_id, context):
         f"💰 Цена за 1 Gold: <b>{fmt(min_p)}–{fmt(max_p)} ₽</b>\n"
         f"📦 Количество: <b>{min_a}–{max_a} Gold</b>\n"
         f"⏱ Длительность: <b>{DURATIONS[duration]}</b>\n"
-        f"🔄 Интервал обновления: <b>{CHECK_INTERVALS.get(interval, str(interval) + ' секунд')}</b>\n"
+        f"🔄 Интервал обновления: <b>{CHECK_INTERVALS[interval]}</b>\n"
         f"📡 Мониторинг: <b>{monitor_status}</b>"
     )
 
@@ -503,6 +510,60 @@ async def send_search_results(message, user_id):
             offer_message(offer, index),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
+        )
+
+
+# ---------------- ТЕСТ МОНИТОРИНГА ----------------
+
+async def test_monitor(update, context):
+    user_id = update.effective_user.id
+
+    if not allowed_user(user_id):
+        return
+
+    await update.message.reply_text(
+        "🧪 Проверяю мониторинг...\n"
+        "Проверяю FunPay, фильтры и отправку Telegram.",
+        reply_markup=MAIN_MENU,
+    )
+
+    try:
+        offers = await asyncio.to_thread(fetch_offers)
+        matches = matching_offers(user_id, offers)
+        interval = get_check_interval(user_id)
+
+        report = (
+            "🧪 <b>РЕЗУЛЬТАТ ТЕСТА</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🟢 FunPay: страница доступна\n"
+            f"📋 Объявлений найдено: <b>{len(offers)}</b>\n"
+            f"🎯 Подходит под фильтры: <b>{len(matches)}</b>\n"
+            f"🔄 Интервал проверки: <b>{CHECK_INTERVALS[interval]}</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🟢 Получение объявлений работает.\n"
+            "🟢 Фильтры проверены."
+        )
+
+        await update.message.reply_text(
+            report,
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_MENU,
+        )
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "📨 <b>ТЕСТОВОЕ УВЕДОМЛЕНИЕ</b>\n"
+                "Если ты получил это сообщение, отправка Telegram работает!"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка теста мониторинга")
+        await update.message.reply_text(
+            f"🔴 Тест не пройден: {type(error).__name__}: {error}",
+            reply_markup=MAIN_MENU,
         )
 
 
@@ -875,6 +936,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await stop_monitor(update, context)
         return
 
+    if text == "🧪 Тест мониторинга":
+        context.user_data.pop("setting", None)
+        await test_monitor(update, context)
+        return
+
     if text == "⚙️ Настройки":
         context.user_data.pop("setting", None)
         await update.message.reply_text(
@@ -894,6 +960,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🔄 Интервал обновления":
         context.user_data.pop("setting", None)
         current = get_check_interval(user_id)
+
         await update.message.reply_text(
             "🔄 <b>ИНТЕРВАЛ ОБНОВЛЕНИЯ</b>\n\n"
             f"Сейчас: <b>{CHECK_INTERVALS[current]}</b>\n\n"
@@ -927,6 +994,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text in DURATION_LABELS:
         context.user_data["monitor_duration"] = DURATION_LABELS[text]
+
         await update.message.reply_text(
             f"✅ Длительность установлена: <b>{text}</b>\n"
             "Теперь нажми «🚀 Запустить».",
@@ -947,6 +1015,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "⬅️ Главное меню":
         context.user_data.pop("setting", None)
         context.user_data.pop("temp_min", None)
+
         await update.message.reply_text(
             "Главное меню:",
             reply_markup=MAIN_MENU,
