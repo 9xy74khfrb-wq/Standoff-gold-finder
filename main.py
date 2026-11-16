@@ -146,6 +146,14 @@ def init_db():
             )
         """)
         db.execute("""
+            CREATE TABLE IF NOT EXISTS offer_prices (
+                user_id INTEGER NOT NULL,
+                offer_id TEXT NOT NULL,
+                price REAL NOT NULL,
+                PRIMARY KEY (user_id, offer_id)
+            )
+        """)
+        db.execute("""
             CREATE TABLE IF NOT EXISTS access_keys (
                 key_hash TEXT PRIMARY KEY,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -254,6 +262,47 @@ def mark_many_seen(user_id, offers):
         db.executemany(
             "INSERT OR IGNORE INTO seen_offers_v2 (user_id, offer_id) VALUES (?, ?)",
             [(user_id, offer["id"]) for offer in offers],
+        )
+
+
+def get_offer_price(user_id, offer_id):
+    with db_connect() as db:
+        row = db.execute(
+            """
+            SELECT price FROM offer_prices
+            WHERE user_id = ? AND offer_id = ?
+            """,
+            (user_id, str(offer_id)),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def save_offer_price(user_id, offer_id, price):
+    with db_connect() as db:
+        db.execute(
+            """
+            INSERT INTO offer_prices (user_id, offer_id, price)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, offer_id)
+            DO UPDATE SET price = excluded.price
+            """,
+            (user_id, str(offer_id), float(price)),
+        )
+
+
+def save_many_offer_prices(user_id, offers):
+    with db_connect() as db:
+        db.executemany(
+            """
+            INSERT INTO offer_prices (user_id, offer_id, price)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, offer_id)
+            DO UPDATE SET price = excluded.price
+            """,
+            [
+                (user_id, str(offer["id"]), float(offer["price"]))
+                for offer in offers
+            ],
         )
 
 
@@ -565,8 +614,10 @@ def offer_keyboard(offer):
     ]])
 
 
-def offer_message(offer, number=None, recent=False):
-    if recent:
+def offer_message(offer, number=None, recent=False, old_price=None):
+    if old_price is not None:
+        heading = "🔔 <b>ИЗМЕНЕНИЕ ЦЕНЫ ОБЪЯВЛЕНИЯ</b>"
+    elif recent:
         heading = "🕑 <b>ОБЪЯВЛЕНИЕ ЗА ПОСЛЕДНИЕ 2 МИНУТЫ</b>"
     elif number is not None:
         heading = f"🆕 <b>ОБЪЯВЛЕНИЕ №{number}</b>"
@@ -584,10 +635,18 @@ def offer_message(offer, number=None, recent=False):
     else:
         seller_text = seller_name
 
+    if old_price is not None:
+        price_text = (
+            f"💰 Было: <b>{fmt(old_price)} ₽</b>\n"
+            f"🆕 Стало: <b>{fmt(offer['price'])} ₽ за 1 Gold</b>"
+        )
+    else:
+        price_text = f"💰 Цена: <b>{fmt(offer['price'])} ₽ за 1 Gold</b>"
+
     return (
         f"{heading}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Цена: <b>{fmt(offer['price'])} ₽ за 1 Gold</b>\n"
+        f"{price_text}\n"
         f"📦 Количество: <b>{offer['amount']} Gold</b>\n"
         f"📱 Платформа: <b>{safe(offer['platform'])}</b>\n"
         f"👤 Продавец: {seller_text}\n"
@@ -726,6 +785,11 @@ async def monitor_loop(application, user_id, duration, interval, stop_event):
             if is_published_recently(offer) and not is_seen(user_id, offer["id"])
         ]
         mark_many_seen(user_id, initial)
+
+        # Начальные цены сохраняются без уведомлений об изменении.
+        # Поэтому первое сканирование не вызывает ложных оповещений.
+        save_many_offer_prices(user_id, initial)
+
         recent_matches = matching_offers(user_id, recent_initial)
 
         await application.bot.send_message(
@@ -737,7 +801,7 @@ async def monitor_loop(application, user_id, duration, interval, stop_event):
                 f"🔄 Проверка: каждые <b>{CHECK_INTERVALS[interval]}</b>\n"
                 f"📋 Уже существующих объявлений: <b>{len(initial)}</b>\n"
                 f"🕑 Недавних объявлений: <b>{len(recent_initial)}</b>\n"
-                "🔔 Проверяю новые объявления."
+                "🔔 Проверяю новые объявления и изменения цен."
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_MENU,
@@ -758,16 +822,36 @@ async def monitor_loop(application, user_id, duration, interval, stop_event):
             try:
                 offers = await asyncio.to_thread(fetch_offers)
                 unique_offers = {offer["id"]: offer for offer in offers}
-                new_offers = [
-                    offer for offer in unique_offers.values()
-                    if not is_seen(user_id, offer["id"])
-                ]
+
+                new_offers = []
+                changed_offers = []
+
+                for offer in unique_offers.values():
+                    offer_id = offer["id"]
+
+                    if not is_seen(user_id, offer_id):
+                        new_offers.append(offer)
+                        continue
+
+                    old_price = get_offer_price(user_id, offer_id)
+
+                    if old_price is None:
+                        # Для старых записей seen_offers_v2 создаём базовую цену
+                        # без уведомления, чтобы избежать ложного оповещения.
+                        save_offer_price(user_id, offer_id, offer["price"])
+                        continue
+
+                    if float(old_price) != float(offer["price"]):
+                        changed_offers.append((offer, old_price))
+
+                # Существующие уведомления о новых объявлениях.
                 matches = matching_offers(user_id, new_offers)
                 matching_ids = {offer["id"] for offer in matches}
 
                 for offer in new_offers:
                     if stop_event.is_set():
                         break
+
                     if offer["id"] in matching_ids:
                         await application.bot.send_message(
                             chat_id=user_id,
@@ -777,7 +861,39 @@ async def monitor_loop(application, user_id, duration, interval, stop_event):
                             reply_markup=offer_keyboard(offer),
                         )
                         log_action(user_id, offer["id"], "notified")
+
                     mark_seen(user_id, offer["id"])
+                    save_offer_price(
+                        user_id, offer["id"], offer["price"]
+                    )
+
+                # Уведомления об изменении цены существующих объявлений.
+                for offer, old_price in changed_offers:
+                    if stop_event.is_set():
+                        break
+
+                    # Обновляем цену даже если новая цена не подходит фильтру.
+                    # Это предотвращает повторные уведомления об одном изменении.
+                    save_offer_price(
+                        user_id, offer["id"], offer["price"]
+                    )
+
+                    if matching_offers(user_id, [offer]):
+                        await application.bot.send_message(
+                            chat_id=user_id,
+                            text=offer_message(
+                                offer,
+                                old_price=old_price,
+                            ),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                            reply_markup=offer_keyboard(offer),
+                        )
+                        log_action(
+                            user_id,
+                            offer["id"],
+                            "price_changed",
+                        )
 
             except Exception:
                 logger.exception("Ошибка проверки FunPay")
