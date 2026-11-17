@@ -844,7 +844,9 @@ async def monitor_loop(application, user_id, duration, interval, stop_event):
                     if float(old_price) != float(offer["price"]):
                         changed_offers.append((offer, old_price))
 
-                # Существующие уведомления о новых объявлениях.
+                # Новые объявления.
+                # Не помечаем объявление просмотренным, пока оно не подходит
+                # под фильтры: цена или количество могут измениться позже.
                 matches = matching_offers(user_id, new_offers)
                 matching_ids = {offer["id"] for offer in matches}
 
@@ -852,16 +854,24 @@ async def monitor_loop(application, user_id, duration, interval, stop_event):
                     if stop_event.is_set():
                         break
 
-                    if offer["id"] in matching_ids:
-                        await application.bot.send_message(
-                            chat_id=user_id,
-                            text=offer_message(offer),
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True,
-                            reply_markup=offer_keyboard(offer),
+                    if offer["id"] not in matching_ids:
+                        # Сохраняем текущую цену, но оставляем ID необработанным.
+                        # На следующем цикле объявление снова проверится по фильтрам.
+                        save_offer_price(
+                            user_id, offer["id"], offer["price"]
                         )
-                        log_action(user_id, offer["id"], "notified")
+                        continue
 
+                    # Сначала отправляем уведомление. Если Telegram вернёт ошибку,
+                    # ID останется необработанным и бот попробует отправить снова.
+                    await application.bot.send_message(
+                        chat_id=user_id,
+                        text=offer_message(offer),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                        reply_markup=offer_keyboard(offer),
+                    )
+                    log_action(user_id, offer["id"], "notified")
                     mark_seen(user_id, offer["id"])
                     save_offer_price(
                         user_id, offer["id"], offer["price"]
