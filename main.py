@@ -50,6 +50,7 @@ DEFAULT_CHECK_INTERVAL = 15
 RECENT_SECONDS = 120
 
 CHECK_INTERVALS = {
+    3: "3 секунды",
     5: "5 секунд",
     10: "10 секунд",
     15: "15 секунд",
@@ -102,9 +103,10 @@ DURATION_MENU = ReplyKeyboardMarkup(
 )
 INTERVAL_MENU = ReplyKeyboardMarkup(
     [
-        ["5 секунд", "10 секунд"],
-        ["15 секунд", "30 секунд"],
-        ["1 минута", "2 минуты"],
+        ["3 секунды", "5 секунд"],
+        ["10 секунд", "15 секунд"],
+        ["30 секунд", "1 минута"],
+        ["2 минуты"],
         ["⬅️ Главное меню"],
     ],
     resize_keyboard=True,
@@ -136,7 +138,6 @@ def init_db():
                 "ALTER TABLE settings ADD COLUMN check_interval INTEGER DEFAULT 15"
             )
 
-        # Отдельная таблица v2, чтобы не конфликтовать со старой схемой seen_offers.
         db.execute("""
             CREATE TABLE IF NOT EXISTS seen_offers_v2 (
                 user_id INTEGER NOT NULL,
@@ -537,7 +538,6 @@ def fetch_offers():
             if seller_element else "Не указан"
         )
 
-        # Получаем ссылку на профиль из ссылки вокруг ника продавца.
         seller_link = None
         if seller_element:
             seller_anchor = (
@@ -786,8 +786,6 @@ async def monitor_loop(application, user_id, duration, interval, stop_event):
         ]
         mark_many_seen(user_id, initial)
 
-        # Начальные цены сохраняются без уведомлений об изменении.
-        # Поэтому первое сканирование не вызывает ложных оповещений.
         save_many_offer_prices(user_id, initial)
 
         recent_matches = matching_offers(user_id, recent_initial)
@@ -836,17 +834,12 @@ async def monitor_loop(application, user_id, duration, interval, stop_event):
                     old_price = get_offer_price(user_id, offer_id)
 
                     if old_price is None:
-                        # Для старых записей seen_offers_v2 создаём базовую цену
-                        # без уведомления, чтобы избежать ложного оповещения.
                         save_offer_price(user_id, offer_id, offer["price"])
                         continue
 
                     if float(old_price) != float(offer["price"]):
                         changed_offers.append((offer, old_price))
 
-                # Новые объявления.
-                # Не помечаем объявление просмотренным, пока оно не подходит
-                # под фильтры: цена или количество могут измениться позже.
                 matches = matching_offers(user_id, new_offers)
                 matching_ids = {offer["id"] for offer in matches}
 
@@ -855,15 +848,11 @@ async def monitor_loop(application, user_id, duration, interval, stop_event):
                         break
 
                     if offer["id"] not in matching_ids:
-                        # Сохраняем текущую цену, но оставляем ID необработанным.
-                        # На следующем цикле объявление снова проверится по фильтрам.
                         save_offer_price(
                             user_id, offer["id"], offer["price"]
                         )
                         continue
 
-                    # Сначала отправляем уведомление. Если Telegram вернёт ошибку,
-                    # ID останется необработанным и бот попробует отправить снова.
                     await application.bot.send_message(
                         chat_id=user_id,
                         text=offer_message(offer),
@@ -877,13 +866,10 @@ async def monitor_loop(application, user_id, duration, interval, stop_event):
                         user_id, offer["id"], offer["price"]
                     )
 
-                # Уведомления об изменении цены существующих объявлений.
                 for offer, old_price in changed_offers:
                     if stop_event.is_set():
                         break
 
-                    # Обновляем цену даже если новая цена не подходит фильтру.
-                    # Это предотвращает повторные уведомления об одном изменении.
                     save_offer_price(
                         user_id, offer["id"], offer["price"]
                     )
